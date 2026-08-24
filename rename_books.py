@@ -42,17 +42,12 @@ under data/. DB `directory` keys are stored relative to data/.
 import os
 import sys
 import json
-import sqlite3
 import argparse
 from pathlib import Path
-from datetime import datetime
 
-# ── optional pretty table ──────────────────────────────────────────────────
-try:
-    from tabulate import tabulate
-    HAS_TABULATE = True
-except ImportError:
-    HAS_TABULATE = False
+from bookshelf.catalog import Catalog
+from bookshelf.config import Config, ConfigError
+from bookshelf.render import table, truncate
 
 # ── OpenAI ─────────────────────────────────────────────────────────────────
 try:
@@ -61,135 +56,29 @@ except ImportError:
     print("Error: 'openai' package not found. Run: pip install openai")
     sys.exit(1)
 
-import tomllib
-
 # ── config ─────────────────────────────────────────────────────────────────
-# SCRIPT_DIR holds the app files (this script, the DB, the config); DATA_DIR is
-# the shelf root where the book categories and __landing/ live. DB `directory`
-# keys are stored relative to DATA_DIR.
-SCRIPT_DIR   = Path(__file__).parent.resolve()
-DATA_DIR     = SCRIPT_DIR / "data"
-CONFIG_FILE  = SCRIPT_DIR / ".rename_books.toml"
-DB_PATH      = SCRIPT_DIR / ".rename_books.db"
-LANDING_DIR  = DATA_DIR / "__landing"
-MODEL        = "gpt-4.1-mini"
+# Paths now come from bookshelf.config.Config rather than module constants, so
+# they can be pointed elsewhere by tests and by --db / --root. CATALOG is set
+# up in main() and holds every query plus the schema.
+CONFIG      = Config.default()
+DATA_DIR    = CONFIG.data_dir
+LANDING_DIR = CONFIG.landing_dir
+MODEL       = CONFIG.model
 
-
-def rel_key(path) -> str:
-    """DB key for a directory: its path relative to DATA_DIR (POSIX).
-
-    The shelf root itself maps to '.'. Paths outside the shelf fall back to
-    their absolute form (shouldn't normally happen).
-    """
-    p = Path(path).resolve()
-    try:
-        return p.relative_to(DATA_DIR).as_posix()
-    except ValueError:
-        return p.as_posix()
-
-
-def abs_dir(key: str) -> Path:
-    """Resolve a DB directory key back to an absolute path under DATA_DIR.
-
-    Joining an absolute key onto DATA_DIR yields the key unchanged, so this
-    also handles any legacy absolute keys gracefully.
-    """
-    return (DATA_DIR / key).resolve()
+CATALOG: Catalog = None  # type: ignore
 
 
 def load_api_key() -> str:
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, "rb") as f:
-            config = tomllib.load(f)
-        key = config.get("openai", {}).get("api_key", "")
-        if key and not key.startswith("sk-..."):
-            return key
-    # fall back to environment variable
-    key = os.environ.get("OPENAI_API_KEY", "")
-    if key:
-        return key
-    print(f"Error: No API key found. Set it in {CONFIG_FILE} or via OPENAI_API_KEY env var.")
-    sys.exit(1)
+    try:
+        return CONFIG.api_key()
+    except ConfigError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
 
-# ── database ───────────────────────────────────────────────────────────────
-
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS renames (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            directory     TEXT NOT NULL,
-            original_name TEXT NOT NULL,
-            proposed_name TEXT,
-            summary       TEXT,
-            status        TEXT NOT NULL DEFAULT 'pending',
-            created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-            applied_at    TEXT,
-            UNIQUE(directory, original_name)
-        )
-    """)
-    conn.commit()
-    return conn
-
-
-def already_tracked_names(conn: sqlite3.Connection, directory: str) -> set[str]:
-    """Return filenames already applied (skip these entirely)."""
-    cur = conn.execute(
-        "SELECT original_name FROM renames WHERE directory = ? AND status = 'applied'",
-        (directory,),
-    )
-    return {row[0] for row in cur}
-
-
-def pending_proposals(conn: sqlite3.Connection, directory: str) -> dict[str, tuple[str, str]]:
-    """Return {original_name: (proposed_name, summary)} for files pending confirmation."""
-    cur = conn.execute(
-        "SELECT original_name, proposed_name, summary FROM renames WHERE directory = ? AND status = 'pending'",
-        (directory,),
-    )
-    return {row[0]: (row[1], row[2] or "") for row in cur}
-
-
-def books_missing_summary(conn: sqlite3.Connection) -> list[tuple[int, str]]:
-    """Return (id, proposed_name) for applied rows not yet attempted (NULL only)."""
-    cur = conn.execute(
-        "SELECT id, proposed_name FROM renames WHERE status = 'applied' AND summary IS NULL"
-    )
-    return cur.fetchall()
-
-
-def save_summaries(conn: sqlite3.Connection, updates: list[tuple[str, int]]):
-    """Persist (summary, id) pairs into the DB."""
-    conn.executemany(
-        "UPDATE renames SET summary = ? WHERE id = ?",
-        updates,
-    )
-    conn.commit()
-
-
-def save_proposals(conn: sqlite3.Connection, directory: str, proposals: list[dict], status: str = "pending"):
-    for p in proposals:
-        conn.execute(
-            """
-            INSERT INTO renames (directory, original_name, proposed_name, summary, status, applied_at)
-            VALUES (?, ?, ?, ?, ?, CASE ? WHEN 'applied' THEN datetime('now', 'localtime') ELSE NULL END)
-            ON CONFLICT(directory, original_name) DO UPDATE SET
-                proposed_name = excluded.proposed_name,
-                summary       = excluded.summary,
-                status        = excluded.status,
-                applied_at    = excluded.applied_at
-            """,
-            (directory, p["original_name"], p["proposed_name"], p.get("summary"), status, status),
-        )
-    conn.commit()
-
-
-def apply_renames(
-    conn: sqlite3.Connection, directory: str, proposals: list[dict]
-) -> tuple[int, int]:
+def apply_renames(directory: str, proposals: list[dict]) -> tuple[int, int]:
     dir_path = Path(directory)
-    key      = rel_key(dir_path)
+    key      = CATALOG.key(dir_path)
     success = errors = 0
     for p in proposals:
         src = dir_path / p["original_name"]
@@ -200,25 +89,18 @@ def apply_renames(
             continue
         try:
             src.rename(dst)
-            conn.execute(
-                """UPDATE renames
-                   SET status = 'applied', applied_at = datetime('now', 'localtime')
-                   WHERE directory = ? AND original_name = ?""",
-                (key, p["original_name"]),
-            )
+            CATALOG.mark_applied(key, p["original_name"])
             success += 1
         except OSError as e:
             print(f"  Error renaming '{src.name}': {e}")
             errors += 1
-    conn.commit()
+    CATALOG.commit()
     return success, errors
 
 
-def apply_moves(
-    conn: sqlite3.Connection, landing_dir: Path, root: Path, proposals: list[dict]
-) -> tuple[int, int]:
+def apply_moves(landing_dir: Path, root: Path, proposals: list[dict]) -> tuple[int, int]:
     """Move files from landing_dir into root/<category>/<title>.pdf."""
-    key     = rel_key(landing_dir)
+    key     = CATALOG.key(landing_dir)
     success = errors = 0
     for p in proposals:
         src     = landing_dir / p["original_name"]
@@ -238,22 +120,16 @@ def apply_moves(
             # Re-key the record to its destination so it becomes an ordinary
             # shelved row (directory = category, proposed_name = title). This
             # leaves no leftover '__landing' rows while preserving the summary.
-            conn.execute(
-                """UPDATE renames
-                   SET directory = ?, original_name = ?, proposed_name = ?,
-                       status = 'applied', applied_at = datetime('now', 'localtime')
-                   WHERE directory = ? AND original_name = ?""",
-                (rel_key(dst_dir), dst.name, dst.name, key, p["original_name"]),
-            )
+            CATALOG.rekey(key, p["original_name"], CATALOG.key(dst_dir), dst.name)
             success += 1
         except OSError as e:
             print(f"  Error moving '{src.name}': {e}")
             errors += 1
-    conn.commit()
+    CATALOG.commit()
     return success, errors
 
 
-def find_duplicates(root: Path, conn: sqlite3.Connection) -> tuple[list[dict], list[tuple[int, str, str]]]:
+def find_duplicates(root: Path) -> tuple[list[dict], list[tuple[int, str, str]]]:
     """
     Returns:
       - duplicate groups: [{filename, keep: Path, remove: [Path], remove_db_ids: [int]}]
@@ -267,12 +143,10 @@ def find_duplicates(root: Path, conn: sqlite3.Connection) -> tuple[list[dict], l
             if fname.lower().endswith(".pdf"):
                 by_name.setdefault(fname, []).append(Path(dirpath) / fname)
 
-    # Index applied DB rows: {(directory, proposed_name): (id, applied_at)}
-    cur = conn.execute(
-        "SELECT id, directory, proposed_name, applied_at FROM renames WHERE status = 'applied'"
-    )
+    # Index applied rows by absolute directory, to match the paths walked above.
     db_index: dict[tuple[str, str], tuple[int, str]] = {
-        (str(abs_dir(row[1])), row[2]): (row[0], row[3] or "") for row in cur
+        (str(CATALOG.path(key)), name): entry
+        for (key, name), entry in CATALOG.applied_index().items()
     }
 
     # Filesystem duplicates
@@ -310,7 +184,7 @@ def find_duplicates(root: Path, conn: sqlite3.Connection) -> tuple[list[dict], l
 
 
 def apply_dedupe(
-    conn: sqlite3.Connection, groups: list[dict], stale: list[tuple[int, str, str]]
+    groups: list[dict], stale: list[tuple[int, str, str]]
 ) -> tuple[int, int]:
     deleted = errors = 0
     for g in groups:
@@ -321,18 +195,8 @@ def apply_dedupe(
             except OSError as e:
                 print(f"  Error deleting '{path}': {e}")
                 errors += 1
-        if g["remove_db_ids"]:
-            conn.execute(
-                f"DELETE FROM renames WHERE id IN ({','.join('?' * len(g['remove_db_ids']))})",
-                g["remove_db_ids"],
-            )
-    if stale:
-        stale_ids = [s[0] for s in stale]
-        conn.execute(
-            f"DELETE FROM renames WHERE id IN ({','.join('?' * len(stale_ids))})",
-            stale_ids,
-        )
-    conn.commit()
+        CATALOG.delete_ids(g["remove_db_ids"])
+    CATALOG.delete_ids(s[0] for s in stale)
     return deleted, errors
 
 
@@ -508,10 +372,6 @@ Return ONLY a valid JSON array — no markdown fences, no explanation. Schema:
     return []
 
 
-def _truncate(s: str, n: int = 200) -> str:
-    return s if len(s) <= n else s[:n - 1] + "…"
-
-
 # ── display ────────────────────────────────────────────────────────────────
 
 def show_preview(groups: list[tuple[Path, list[dict]]], root: Path):
@@ -529,40 +389,24 @@ def show_preview(groups: list[tuple[Path, list[dict]]], root: Path):
                 label = directory
             print(f"\n{label}/")
         rows = [
-            (counter + i, p["original_name"], p["proposed_name"], _truncate(p.get("summary") or ""))
+            (counter + i, p["original_name"], p["proposed_name"], truncate(p.get("summary") or ""))
             for i, p in enumerate(proposals)
         ]
         counter += len(proposals)
-        if HAS_TABULATE:
-            print(tabulate(rows, headers=["#", "Original", "Renamed to", "Description"], tablefmt="simple"))
-        else:
-            col = max(len(p["original_name"]) for p in proposals) + 2
-            print(f"{'#':<4} {'Original':<{col}} Renamed to")
-            print("─" * (col + 60))
-            for num, orig, new, desc in rows:
-                print(f"{num:<4} {orig:<{col}} {new}")
-                if desc:
-                    print(f"     {desc}")
+        print(table(rows, ["#", "Original", "Renamed to", "Description"], detail_last=True))
 
 
 def show_landing_preview(proposals: list[dict]):
     rows = [
-        (i + 1, p["original_name"], p["category"], p["display_name"], _truncate(p.get("summary") or ""))
+        (i + 1, p["original_name"], p["category"], p["display_name"], truncate(p.get("summary") or ""))
         for i, p in enumerate(proposals)
     ]
-    if HAS_TABULATE:
-        print(tabulate(rows, headers=["#", "Original", "Category", "Renamed to", "Description"], tablefmt="simple"))
-    else:
-        col_orig = max(len(p["original_name"]) for p in proposals) + 2
-        col_cat  = max(len(p["category"])      for p in proposals) + 2
-        col_name = max(len(p["display_name"])  for p in proposals) + 2
-        print(f"{'#':<4} {'Original':<{col_orig}} {'Category':<{col_cat}} {'Renamed to':<{col_name}} Description")
-        print("─" * (col_orig + col_cat + col_name + 70))
-        for num, orig, cat, name, desc in rows:
-            print(f"{num:<4} {orig:<{col_orig}} {cat:<{col_cat}} {name:<{col_name}} {desc}")
+    print(table(rows, ["#", "Original", "Category", "Renamed to", "Description"], detail_last=True))
 
 
 def show_dedupe_preview(groups: list[dict], stale: list[tuple[int, str, str]], root: Path):
+    db_index = CATALOG.applied_index()
+
     def rel(p: Path) -> str:
         try:
             return str(p.relative_to(root))
@@ -575,7 +419,8 @@ def show_dedupe_preview(groups: list[dict], stale: list[tuple[int, str, str]], r
             print(f"  {g['filename']}")
             print(f"    KEEP   {rel(g['keep'])}")
             for p in g["remove"]:
-                db_note = "  (+ DB record)" if (str(p.parent), g["filename"]) else ""
+                key = (CATALOG.key(p.parent), g["filename"])
+                db_note = "  (+ DB record)" if key in db_index else ""
                 print(f"    REMOVE {rel(p)}{db_note}")
         print()
 
@@ -651,6 +496,19 @@ def main():
         "--dedupe", action="store_true",
         help="Find and remove duplicate PDFs across category directories and clean stale DB records",
     )
+    parser.add_argument(
+        "--db", default=None,
+        help="Path to the catalog DB (default: .rename_books.db beside this script)",
+    )
+    parser.add_argument(
+        "--root", default=None,
+        help="Shelf root holding the category directories (default: data/)",
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to the TOML config holding the API key "
+             "(default: .rename_books.toml beside this script)",
+    )
     args = parser.parse_args()
 
     if args.category and not args.new:
@@ -658,11 +516,18 @@ def main():
     if args.fresh and not args.new:
         parser.error("--fresh only applies together with --new")
 
-    conn = init_db()
+    global CONFIG, DATA_DIR, LANDING_DIR, MODEL, CATALOG
+    CONFIG      = Config.from_args(args)
+    DATA_DIR    = CONFIG.data_dir
+    LANDING_DIR = CONFIG.landing_dir
+    MODEL       = CONFIG.model
+
+    CATALOG = Catalog(CONFIG)
+    CATALOG.migrate()
 
     # ── backfill-summaries mode ───────────────────────────────────────────
     if args.backfill_summaries:
-        missing = books_missing_summary(conn)
+        missing = CATALOG.missing_summaries()
         if not missing:
             print("All summaries already filled.")
             sys.exit(0)
@@ -676,14 +541,14 @@ def main():
             for row_id, proposed_name in missing
             if Path(proposed_name).stem in title_map
         ]
-        save_summaries(conn, updates)
+        CATALOG.set_summaries(updates)
         filled = sum(1 for summary, _ in updates if summary)
         print(f"Done. {filled}/{len(missing)} summaries added.")
         sys.exit(0)
 
     # ── dedupe mode ──────────────────────────────────────────────────────
     if args.dedupe:
-        groups, stale = find_duplicates(DATA_DIR, conn)
+        groups, stale = find_duplicates(DATA_DIR)
         if not groups and not stale:
             print("No duplicates or stale records found.")
             sys.exit(0)
@@ -698,7 +563,7 @@ def main():
             print("Aborted.")
             sys.exit(0)
 
-        deleted, errors = apply_dedupe(conn, groups, stale)
+        deleted, errors = apply_dedupe(groups, stale)
         print(f"\nDone. {deleted} file(s) deleted, {errors} error(s).")
         sys.exit(0)
 
@@ -722,16 +587,12 @@ def main():
         forced_category = args.category.strip()
 
         if args.fresh:
-            cur = conn.execute(
-                "DELETE FROM renames WHERE directory = ? AND status = 'pending'",
-                (rel_key(LANDING_DIR),),
-            )
-            conn.commit()
-            if cur.rowcount:
-                print(f"Cleared {cur.rowcount} previously proposed move(s); starting fresh.")
+            cleared = CATALOG.clear_pending(CATALOG.key(LANDING_DIR))
+            if cleared:
+                print(f"Cleared {cleared} previously proposed move(s); starting fresh.")
 
-        applied       = already_tracked_names(conn, rel_key(LANDING_DIR))
-        pending       = pending_proposals(conn, rel_key(LANDING_DIR))
+        applied       = CATALOG.applied_names(CATALOG.key(LANDING_DIR))
+        pending       = CATALOG.pending(CATALOG.key(LANDING_DIR))
         total_skipped = sum(1 for f in all_pdfs if f in applied)
 
         pending_here: list[dict] = []
@@ -800,7 +661,7 @@ def main():
             show_landing_preview(move_proposals)
             print()
 
-            save_proposals(conn, rel_key(LANDING_DIR), move_proposals, status="pending")
+            CATALOG.stage(CATALOG.key(LANDING_DIR), move_proposals, status="pending")
 
             answer = input("Apply these moves? [y/N] or enter a row number to edit its category: ").strip()
             if answer.lower() == "y":
@@ -823,7 +684,7 @@ def main():
             else:
                 print("  Enter y, n, or a row number.")
 
-        ok, err = apply_moves(conn, LANDING_DIR, DATA_DIR, move_proposals)
+        ok, err = apply_moves(LANDING_DIR, DATA_DIR, move_proposals)
         print(f"\nDone. {ok} moved, {err} error(s).")
         sys.exit(0)
 
@@ -849,8 +710,8 @@ def main():
     total_skipped = 0
 
     for directory, all_pdfs in dir_groups:
-        applied  = already_tracked_names(conn, rel_key(directory))
-        pending  = pending_proposals(conn, rel_key(directory))
+        applied  = CATALOG.applied_names(CATALOG.key(directory))
+        pending  = CATALOG.pending(CATALOG.key(directory))
         total_skipped += len([f for f in all_pdfs if f in applied])
 
         # Files with a saved pending proposal — re-surface without API call
@@ -917,7 +778,7 @@ def main():
         # ── auto-track files that are already correctly named ─────────────
         total_correct = sum(len(p) for _, p in already_correct)
         for directory, proposals in already_correct:
-            save_proposals(conn, rel_key(directory), proposals, status="applied")
+            CATALOG.stage(CATALOG.key(directory), proposals, status="applied")
         if total_correct:
             print(f"Auto-tracked {total_correct} already correctly-named file(s).")
     elif not pending_groups and total_skipped:
@@ -934,7 +795,7 @@ def main():
     print()
 
     for directory, proposals in rename_groups:
-        save_proposals(conn, rel_key(directory), proposals, status="pending")
+        CATALOG.stage(CATALOG.key(directory), proposals, status="pending")
 
     # ── confirm ───────────────────────────────────────────────────────────
     answer = input("Apply these renames? [y/N] ").strip().lower()
@@ -945,7 +806,7 @@ def main():
     # ── apply ─────────────────────────────────────────────────────────────
     total_ok = total_err = 0
     for directory, proposals in rename_groups:
-        ok, err = apply_renames(conn, str(directory), proposals)
+        ok, err = apply_renames(str(directory), proposals)
         total_ok  += ok
         total_err += err
 

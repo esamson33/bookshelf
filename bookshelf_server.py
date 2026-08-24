@@ -2,30 +2,33 @@
 """
 bookshelf_server.py — Local web UI for the Bookshelf.
 
-Serves a two-pane reader backed by the same SQLite DB that rename_books.py
-maintains (.rename_books.db). Standard library only — no pip installs.
+Serves a two-pane reader backed by the same catalog DB the bookshelf CLI
+maintains. Standard library only — no pip installs.
 
     python bookshelf_server.py            # http://127.0.0.1:8765
     python bookshelf_server.py --port 9000
     python bookshelf_server.py --db /path/to/other.db --root /path/to/shelf
 
 Features:
-  • Browse books grouped by category (the DB `directory` column).
+  • Browse books grouped by category (the catalog `directory` column).
   • Search across filename + summary.
   • "Recent" section: the 10 most recently opened books.
   • Read a book's PDF in the right-hand pane.
 
 Opening a book stamps `accessed_at`, which drives the Recent list.
+
+All SQL and schema handling lives in bookshelf.catalog.Catalog, which this
+module shares with the CLI.
 """
 import argparse
 import json
 import mimetypes
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-import sqlite3
+from bookshelf.catalog import Catalog, is_helper_dir
+from bookshelf.config import Config
 
 # Explicit content types for assets Python's mimetypes may not know (ES modules,
 # PDF.js cmaps/fonts/locale). Serving .mjs with a JS type is required or the
@@ -44,108 +47,28 @@ MIME_OVERRIDES = {
 SCRIPT_DIR = Path(__file__).parent.resolve()
 UI_FILE    = SCRIPT_DIR / "bookshelf_ui.html"
 
-# Populated in main(); shared across handler threads (guarded by DB_LOCK).
-CONN: sqlite3.Connection = None  # type: ignore
-DB_LOCK = threading.Lock()
-# Shelf root: where the book categories and __landing/ live. Defaults to data/
-# (the app files — script, DB, UI, vendor — stay at SCRIPT_DIR).
-SHELF_ROOT: Path = SCRIPT_DIR / "data"
-
-
-def ensure_schema(conn: sqlite3.Connection):
-    """Add the accessed_at column if an older DB predates it."""
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(renames)")]
-    if "accessed_at" not in cols:
-        conn.execute("ALTER TABLE renames ADD COLUMN accessed_at TEXT")
-        conn.commit()
+# Populated in main(); shared across handler threads (the Catalog locks
+# internally, so handlers need no lock of their own).
+CATALOG: Catalog = None  # type: ignore
 
 
 # ── data access ──────────────────────────────────────────────────────────────
 
-def _is_helper_dir(directory: str) -> bool:
-    """Helper locations (e.g. __landing) aren't real categories."""
-    top = (directory or "").split("/", 1)[0]
-    return top.startswith(("_", "."))
-
-
-# _is_helper_dir() as a SQL predicate, so the filter runs before ORDER BY/LIMIT
-# instead of after the fetch. Equivalent because the first character of the
-# leading path component is just the first character of the column.
-NOT_HELPER_SQL = "substr(directory, 1, 1) NOT IN ('_', '.')"
-
-
-def all_books() -> list[dict]:
-    with DB_LOCK:
-        cur = CONN.execute(
-            f"""SELECT id, directory, proposed_name, summary, accessed_at
-                FROM renames WHERE status = 'applied' AND {NOT_HELPER_SQL}
-                ORDER BY directory, proposed_name COLLATE NOCASE"""
-        )
-        return [
-            {
-                "id":       r["id"],
-                "category": r["directory"],
-                "filename": r["proposed_name"],
-                "summary":  r["summary"] or "",
-                "accessed_at": r["accessed_at"],
-            }
-            for r in cur
-        ]
-
-
-def recent_books(limit: int = 10) -> list[dict]:
-    with DB_LOCK:
-        cur = CONN.execute(
-            f"""SELECT id, directory, proposed_name, accessed_at
-                FROM renames
-                WHERE status = 'applied' AND accessed_at IS NOT NULL
-                  AND {NOT_HELPER_SQL}
-                ORDER BY accessed_at DESC
-                LIMIT ?""",
-            (limit,),
-        )
-        return [
-            {
-                "id":       r["id"],
-                "category": r["directory"],
-                "filename": r["proposed_name"],
-                "accessed_at": r["accessed_at"],
-            }
-            for r in cur
-        ]
-
-
 def unclassified_count() -> int:
     """Number of PDFs physically waiting in the __landing/ staging folder."""
-    landing = SHELF_ROOT / "__landing"
+    landing = CATALOG.config.landing_dir
     if not landing.is_dir():
         return 0
     return sum(1 for f in landing.iterdir()
                if f.is_file() and f.suffix.lower() == ".pdf")
 
 
-def mark_opened(book_id: int) -> bool:
-    with DB_LOCK:
-        cur = CONN.execute(
-            "UPDATE renames SET accessed_at = datetime('now', 'localtime') WHERE id = ?",
-            (book_id,),
-        )
-        CONN.commit()
-        return cur.rowcount > 0
-
-
 def book_info(book_id: int) -> dict | None:
     """Everything the info modal shows, minus the cover (rendered client-side)."""
-    with DB_LOCK:
-        row = CONN.execute(
-            """SELECT id, directory, original_name, proposed_name, summary,
-                      applied_at, accessed_at
-               FROM renames WHERE id = ? AND status = 'applied'""",
-            (book_id,),
-        ).fetchone()
-    if not row or _is_helper_dir(row["directory"]):
+    row = CATALOG.book_row(book_id)
+    if not row or row["status"] != "applied" or is_helper_dir(row["directory"]):
         return None
-    path = book_path(book_id)
+    path = CATALOG.book_path(book_id)
     return {
         "id":            row["id"],
         "category":      row["directory"],
@@ -157,20 +80,6 @@ def book_info(book_id: int) -> dict | None:
         "size":          path.stat().st_size if path else None,
         "missing":       path is None,
     }
-
-
-def book_path(book_id: int) -> Path | None:
-    with DB_LOCK:
-        row = CONN.execute(
-            "SELECT directory, proposed_name FROM renames WHERE id = ?", (book_id,)
-        ).fetchone()
-    if not row:
-        return None
-    candidate = (SHELF_ROOT / row["directory"] / row["proposed_name"]).resolve()
-    # Guard against path traversal — must stay inside the shelf.
-    if SHELF_ROOT not in candidate.parents and candidate != SHELF_ROOT:
-        return None
-    return candidate if candidate.is_file() else None
 
 
 # ── HTTP handler ─────────────────────────────────────────────────────────────
@@ -211,12 +120,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_ui()
         if path == "/api/books":
             return self._send_json({
-                "books": all_books(),
-                "recent": recent_books(),
+                "books": CATALOG.all_books(),
+                "recent": CATALOG.recent_books(),
                 "unclassified": unclassified_count(),
             })
         if path == "/api/recent":
-            return self._send_json({"recent": recent_books()})
+            return self._send_json({"recent": CATALOG.recent_books()})
         if path.startswith("/api/book/"):
             raw = path[len("/api/book/"):]
             info = book_info(int(raw)) if raw.isdigit() else None
@@ -236,8 +145,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/api/open/"):
             raw = path[len("/api/open/"):]
-            if raw.isdigit() and mark_opened(int(raw)):
-                return self._send_json({"recent": recent_books()})
+            if raw.isdigit() and CATALOG.mark_opened(int(raw)):
+                return self._send_json({"recent": CATALOG.recent_books()})
             return self._send_json({"error": "unknown book"}, status=404)
         return self._not_found()
 
@@ -267,7 +176,7 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_pdf(self, raw_id: str):
         if not raw_id.isdigit():
             return self._not_found()
-        path = book_path(int(raw_id))
+        path = CATALOG.book_path(int(raw_id))
         if path is None:
             return self._not_found()
 
@@ -304,27 +213,26 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global CONN, SHELF_ROOT
+    global CATALOG
 
+    defaults = Config.default()
     ap = argparse.ArgumentParser(description="Local web UI for the Bookshelf.")
     ap.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
-    ap.add_argument("--db", default=str(SCRIPT_DIR / ".rename_books.db"),
-                    help="Path to the SQLite DB (default: .rename_books.db beside this script)")
-    ap.add_argument("--root", default=str(SCRIPT_DIR / "data"),
+    ap.add_argument("--db", default=str(defaults.db_path),
+                    help=f"Path to the catalog DB (default: {defaults.db_path.name} beside this script)")
+    ap.add_argument("--root", default=str(defaults.data_dir),
                     help="Shelf root used to resolve PDF files (default: the data/ folder)")
     args = ap.parse_args()
 
-    SHELF_ROOT = Path(args.root).resolve()
-    CONN = sqlite3.connect(args.db, check_same_thread=False)
-    CONN.row_factory = sqlite3.Row
-    ensure_schema(CONN)
+    CATALOG = Catalog(Config.from_args(args), threaded=True)
+    CATALOG.migrate()
 
-    n = CONN.execute("SELECT COUNT(*) FROM renames WHERE status='applied'").fetchone()[0]
+    n = CATALOG.applied_count()
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
-    print(f"Bookshelf UI serving {n} book(s) from {SHELF_ROOT}")
-    print(f"  DB : {args.db}")
-    print(f"  →  {url}   (Ctrl-C to stop)")
+    print(f"Bookshelf UI serving {n} book(s) from {CATALOG.config.data_dir}")
+    print(f"  DB : {CATALOG.config.db_path}")
+    print(f"  \u2192  {url}   (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
