@@ -1,0 +1,16 @@
+# Secrets — holds the OpenAI API key. See .rename_books.toml.example.
+.rename_books.toml
+.bookshelf.toml
+
+# The shelf itself: ~2.5G of PDFs, tracked in the catalog DB, not in git.
+data/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

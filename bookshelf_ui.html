@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bookshelf</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --panel-2: #f0f2f5;
+    --border: #e2e5ea;
+    --text: #1c2230;
+    --muted: #6b7382;
+    --accent: #3b6ef5;
+    --accent-soft: #e7efff;
+    --shadow: 0 1px 3px rgba(20,25,40,.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1117;
+      --panel: #161a22;
+      --panel-2: #1c212b;
+      --border: #262c38;
+      --text: #e6e9ef;
+      --muted: #8a93a3;
+      --accent: #5b8bff;
+      --accent-soft: #1d2a45;
+      --shadow: 0 1px 3px rgba(0,0,0,.4);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--text); background: var(--bg);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--border); flex: none;
+  }
+  header .brand { font-weight: 650; font-size: 15px; letter-spacing: .2px; white-space: nowrap; }
+  header .brand .count { color: var(--muted); font-weight: 400; margin-left: 6px; font-size: 13px; }
+  .search { flex: 1; position: relative; max-width: 520px; }
+  .search input {
+    width: 100%; padding: 8px 32px 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    font-size: 14px; outline: none;
+  }
+  .search input:focus { border-color: var(--accent); background: var(--panel); }
+  .search .clear {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    border: none; background: none; color: var(--muted); cursor: pointer;
+    font-size: 16px; line-height: 1; padding: 2px 4px; display: none;
+  }
+
+  main { flex: 1; display: flex; min-height: 0; }
+
+  aside {
+    width: 30vw; flex: none; background: var(--panel);
+    overflow-y: auto; padding: 8px 0 40px;
+  }
+
+  .splitter {
+    flex: none; width: 6px; cursor: col-resize; background: var(--border);
+    position: relative;
+  }
+  .splitter::before {
+    content: ""; position: absolute; inset: 0 -3px; /* wider hit area */
+  }
+  .splitter:hover, .splitter.dragging { background: var(--accent); }
+  body.resizing { cursor: col-resize; user-select: none; }
+  body.resizing iframe { pointer-events: none; }  /* don't let the PDF eat drag events */
+
+  .section-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .7px;
+    color: var(--muted); font-weight: 650;
+    padding: 14px 16px 6px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .section-title .actions { margin-left: auto; display: flex; gap: 4px; }
+  .section-title .actions button {
+    border: none; background: none; cursor: pointer; padding: 2px 5px;
+    border-radius: 4px; color: var(--muted); font: inherit; line-height: 1;
+  }
+  .section-title .actions button:hover { background: var(--panel-2); color: var(--text); }
+
+  .cat { border: none; }
+  .cat-head {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 8px 16px; background: none; border: none; cursor: pointer;
+    color: var(--text); font-size: 13.5px; font-weight: 600; text-align: left;
+  }
+  .cat-head:hover { background: var(--panel-2); }
+  .cat-head .chev { color: var(--muted); font-size: 10px; transition: transform .12s; width: 10px; }
+  .cat-head.collapsed .chev { transform: rotate(-90deg); }
+  .cat-head .badge { margin-left: auto; color: var(--muted); font-weight: 500; font-size: 12px; }
+  .cat-body { display: block; }
+  .cat-body.hidden { display: none; }
+
+  .book {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    border: none; background: none; color: var(--text);
+    padding: 7px 16px 7px 34px; border-left: 3px solid transparent;
+  }
+  .book:hover { background: var(--panel-2); }
+  .book.active { background: var(--accent-soft); border-left-color: var(--accent); }
+  .book .title {
+    font-size: 13px; font-weight: 500;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .book .summary {
+    font-size: 11.5px; color: var(--muted); margin-top: 2px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .book .cat-hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  .empty { color: var(--muted); padding: 10px 16px; font-size: 13px; }
+
+  /* an info affordance per book — revealed on hover/focus so the list stays calm */
+  .book-row { position: relative; }
+  .book-row .book { padding-right: 34px; }
+  .info-btn {
+    position: absolute; top: 5px; right: 6px; width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center;
+    border: none; background: none; border-radius: 50%; cursor: pointer;
+    color: var(--muted); font-size: 13px; line-height: 1;
+    opacity: 0; transition: opacity .12s;
+  }
+  .book-row:hover .info-btn, .info-btn:focus-visible { opacity: 1; }
+  .info-btn:hover { background: var(--border); color: var(--accent); }
+
+  /* ── book info modal: cover on the top 2/3, details on the bottom 1/3 ──── */
+  .backdrop {
+    position: fixed; inset: 0; z-index: 50; padding: 24px;
+    background: rgba(8, 11, 18, .55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal {
+    position: relative; width: min(560px, 100%); height: min(80vh, 820px);
+    display: grid; grid-template-rows: 2fr 1fr;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; overflow: hidden;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .38);
+  }
+  .modal .cover {
+    display: flex; align-items: center; justify-content: center;
+    background: var(--panel-2); border-bottom: 1px solid var(--border);
+    padding: 16px; overflow: hidden;
+  }
+  .modal .cover img {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+    border-radius: 3px; box-shadow: 0 4px 16px rgba(0, 0, 0, .25);
+  }
+  .modal .cover .cover-msg { color: var(--muted); font-size: 12.5px; text-align: center; }
+  .modal .details {
+    padding: 14px 16px 16px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .modal .details h2 { margin: 0; font-size: 14.5px; font-weight: 650; line-height: 1.35; padding-right: 24px; }
+  .modal .meta {
+    display: flex; flex-wrap: wrap; gap: 3px 10px;
+    color: var(--muted); font-size: 11.5px;
+  }
+  .modal .modal-summary { font-size: 12.5px; line-height: 1.55; }
+  .modal .modal-summary.none { color: var(--muted); font-style: italic; }
+  .modal .read {
+    align-self: flex-start; margin-top: auto; padding: 7px 14px;
+    border: none; border-radius: 7px; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600; font-size: 12.5px;
+  }
+  .modal .close {
+    position: absolute; top: 8px; right: 8px; width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    border: none; border-radius: 50%; cursor: pointer;
+    background: rgba(0, 0, 0, .35); color: #fff; font-size: 17px; line-height: 1;
+  }
+  .modal .close:hover { background: rgba(0, 0, 0, .55); }
+
+
+  .notice {
+    margin: 10px 12px 4px; padding: 9px 12px; border-radius: 8px;
+    background: var(--accent-soft); border: 1px solid var(--border);
+    color: var(--text); font-size: 12.5px; line-height: 1.45;
+  }
+  .notice b { font-weight: 650; }
+  .notice code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+    background: var(--panel-2); padding: 1px 5px; border-radius: 4px;
+  }
+
+  .viewer { flex: 1; min-width: 0; background: var(--panel-2); position: relative; }
+  .viewer iframe { width: 100%; height: 100%; border: none; }
+  .viewer .placeholder {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 10px; color: var(--muted); text-align: center; padding: 24px;
+  }
+  .viewer .placeholder .big { font-size: 34px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">📚 Bookshelf<span class="count" id="count"></span></div>
+    <div class="search">
+      <input id="q" type="search" placeholder="Search titles and summaries…" autocomplete="off">
+      <button class="clear" id="clear" title="Clear">×</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="sidebar"><div class="empty">Loading…</div></aside>
+    <div class="splitter" id="splitter" title="Drag to resize"></div>
+    <section class="viewer">
+      <iframe id="pdf" title="PDF reader" style="display:none"></iframe>
+      <div class="placeholder" id="placeholder">
+        <div class="big">📖</div>
+        <div>Select a book on the left to start reading.</div>
+      </div>
+    </section>
+  </main>
+
+<script>
+(() => {
+  let BOOKS = [];
+  let RECENT = [];
+  let UNCLASSIFIED = 0;
+  let activeId = null;
+  const $ = sel => document.querySelector(sel);
+  const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+  // ── persistence (localStorage, resilient to private-mode failures) ─────────
+  const KEY_W = 'bookshelf.sidebarWidth';
+  const KEY_E = 'bookshelf.expanded';
+  const KEY_LAST = 'bookshelf.lastBook';
+  const store = {
+    get(k)   { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k,v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  };
+  // category names the user has opened (collapsed by default), restored from storage
+  const expanded = new Set((() => {
+    try { return JSON.parse(store.get(KEY_E)) || []; } catch (e) { return []; }
+  })());
+  const saveExpanded = () => store.set(KEY_E, JSON.stringify([...expanded]));
+
+  async function load() {
+    const r = await fetch('/api/books');
+    const data = await r.json();
+    BOOKS = data.books;
+    RECENT = data.recent;
+    UNCLASSIFIED = data.unclassified || 0;
+    $('#count').textContent = `· ${BOOKS.length}`;
+    render();
+    restoreLast();
+  }
+
+  async function refreshRecent() {
+    try {
+      const r = await fetch('/api/recent');
+      RECENT = (await r.json()).recent;
+      if (!$('#q').value.trim()) render();
+    } catch (e) { /* ignore */ }
+  }
+
+  // Show a book in the viewer + highlight it. Does NOT record an access.
+  // Uses the PDF.js viewer, which remembers per-document page/scroll/zoom in
+  // localStorage and restores it automatically (no #page hash → don't override).
+  function showBook(book) {
+    activeId = book.id;
+    const frame = $('#pdf');
+    frame.src = `/vendor/pdfjs/web/viewer.html?file=${encodeURIComponent('/pdf/' + book.id)}`;
+    frame.style.display = 'block';
+    $('#placeholder').style.display = 'none';
+    // update active highlight without a full re-render flicker
+    document.querySelectorAll('.book.active').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll(`.book[data-id="${book.id}"]`).forEach(el => el.classList.add('active'));
+  }
+
+  // User-initiated open: show it, remember it, and record the access.
+  function open(book) {
+    showBook(book);
+    store.set(KEY_LAST, String(book.id));
+    fetch(`/api/open/${book.id}`, { method: 'POST' })
+      .then(() => refreshRecent())
+      .catch(() => {});
+  }
+
+  // Reopen the last book read (restores view only; no access stamp).
+  function restoreLast() {
+    const id = parseInt(store.get(KEY_LAST), 10);
+    if (!Number.isFinite(id)) return;
+    const book = BOOKS.find(b => b.id === id);
+    if (book) showBook(book);
+  }
+
+  const stemOf = book => book.filename.replace(/\.pdf$/i, '');
+
+  // A row = the book button plus an info affordance overlaid at its right edge
+  // (a button can't nest inside a button, hence the wrapper).
+  function bookButton(book, {showCat = false} = {}) {
+    const row = document.createElement('div');
+    row.className = 'book-row';
+
+    const b = document.createElement('button');
+    b.className = 'book' + (book.id === activeId ? ' active' : '');
+    b.dataset.id = book.id;
+    const stem = stemOf(book);
+    let html = `<div class="title">${esc(stem)}</div>`;
+    if (showCat) html += `<div class="cat-hint">${esc(book.category)}</div>`;
+    else if (book.summary) html += `<div class="summary">${esc(book.summary)}</div>`;
+    b.innerHTML = html;
+    b.addEventListener('click', () => open(book));
+
+    const info = document.createElement('button');
+    info.className = 'info-btn';
+    info.type = 'button';
+    info.textContent = '\u24d8';
+    info.title = 'Book info';
+    info.setAttribute('aria-label', `Info about ${stem}`);
+    info.addEventListener('click', e => { e.stopPropagation(); showInfo(book); });
+
+    row.appendChild(b);
+    row.appendChild(info);
+    return row;
+  }
+
+  // ── info modal ─────────────────────────────────────────────────────────────
+  const covers = new Map();   // book id → {url, pages} for page 1, rendered once
+  let pdfLibPromise = null;
+  let lastFocus = null;
+
+  function pdfLib() {
+    if (!pdfLibPromise) {
+      pdfLibPromise = import('/vendor/pdfjs/build/pdf.mjs').then(lib => {
+        lib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/build/pdf.worker.mjs';
+        return lib;
+      });
+    }
+    return pdfLibPromise;
+  }
+
+  // Rasterise page 1 as the cover. Cached per book — a shelf's covers never change.
+  async function coverFor(id) {
+    if (covers.has(id)) return covers.get(id);
+    const lib = await pdfLib();
+    // disableAutoFetch: only pull the byte ranges page 1 needs, not the whole book.
+    const doc = await lib.getDocument({ url: `/pdf/${id}`, disableAutoFetch: true }).promise;
+    try {
+      const page = await doc.getPage(1);
+      const unit = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: Math.min(1000 / unit.width, 3) });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      const out = { url: canvas.toDataURL('image/png'), pages: doc.numPages };
+      covers.set(id, out);
+      return out;
+    } finally {
+      doc.destroy();
+    }
+  }
+
+  const fmtSize = n => n == null ? null
+    : n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+  const fmtDate = s => {
+    const d = s ? new Date(s.replace(' ', 'T')) : null;
+    return d && !isNaN(d) ? d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : null;
+  };
+
+  function closeModal() {
+    const back = $('#backdrop');
+    if (!back) return;
+    back.remove();
+    document.removeEventListener('keydown', onModalKey);
+    if (lastFocus) lastFocus.focus();
+    lastFocus = null;
+  }
+  const onModalKey = e => { if (e.key === 'Escape') closeModal(); };
+
+  function showInfo(book) {
+    closeModal();
+    lastFocus = document.activeElement;
+
+    const back = document.createElement('div');
+    back.className = 'backdrop';
+    back.id = 'backdrop';
+    back.innerHTML =
+      '<div class="modal" role="dialog" aria-modal="true" aria-label="Book info">' +
+        '<div class="cover"><div class="cover-msg">Rendering cover…</div></div>' +
+        '<div class="details">' +
+          `<h2>${esc(stemOf(book))}</h2>` +
+          '<div class="meta"></div>' +
+          '<div class="modal-summary"></div>' +
+          '<button type="button" class="read">Read this book</button>' +
+        '</div>' +
+        '<button type="button" class="close" title="Close" aria-label="Close">\u00d7</button>' +
+      '</div>';
+    back.addEventListener('click', e => { if (e.target === back) closeModal(); });
+    back.querySelector('.close').addEventListener('click', closeModal);
+    back.querySelector('.read').addEventListener('click', () => { closeModal(); open(book); });
+    document.body.appendChild(back);
+    document.addEventListener('keydown', onModalKey);
+    back.querySelector('.close').focus();
+
+    const alive = () => document.getElementById('backdrop') === back;
+    const summary = back.querySelector('.modal-summary');
+    if (book.summary) summary.textContent = book.summary;
+    else { summary.textContent = 'No summary recorded for this book.'; summary.classList.add('none'); }
+
+    // Named slots so the two async fills below can't duplicate or reorder facts.
+    const meta = back.querySelector('.meta');
+    const facts = { category: book.category, pages: null, size: null, last: null, from: null };
+    const paint = () => {
+      meta.replaceChildren(...['category', 'pages', 'size', 'last', 'from']
+        .map(k => facts[k]).filter(Boolean)
+        .map(t => Object.assign(document.createElement('span'), { textContent: t })));
+    };
+    paint();
+
+    // Metadata and cover load independently — neither blocks the other.
+    fetch(`/api/book/${book.id}`).then(r => r.json()).then(info => {
+      if (!alive() || info.error) return;
+      if (info.summary && !book.summary) { summary.textContent = info.summary; summary.classList.remove('none'); }
+      const last = fmtDate(info.accessed_at);
+      facts.size = fmtSize(info.size);
+      facts.last = last ? `Last read ${last}` : 'Never opened';
+      if (info.original_name !== info.filename) facts.from = `Filed from “${info.original_name}”`;
+      paint();
+    }).catch(() => {});
+
+    coverFor(book.id).then(({ url, pages }) => {
+      if (!alive()) return;
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = `Cover of ${stemOf(book)}`;
+      back.querySelector('.cover').replaceChildren(img);
+      facts.pages = `${pages} page${pages === 1 ? '' : 's'}`;
+      paint();
+    }).catch(() => {
+      if (!alive()) return;
+      back.querySelector('.cover').replaceChildren(
+        Object.assign(document.createElement('div'),
+          { className: 'cover-msg', textContent: 'Cover unavailable — the PDF could not be rendered.' }));
+    });
+  }
+
+  function render() {
+    const q = $('#q').value.trim().toLowerCase();
+    $('#clear').style.display = q ? 'block' : 'none';
+    const side = $('#sidebar');
+    side.innerHTML = '';
+
+    if (UNCLASSIFIED > 0) {
+      const n = document.createElement('div');
+      n.className = 'notice';
+      const plural = UNCLASSIFIED === 1 ? 'file' : 'files';
+      n.innerHTML = `<b>${UNCLASSIFIED}</b> unclassified ${plural} waiting in ` +
+                    `<code>__landing/</code>. Run <code>./rename_books.py --new</code> to file ${UNCLASSIFIED === 1 ? 'it' : 'them'}.`;
+      side.appendChild(n);
+    }
+
+    if (q) {
+      const hits = BOOKS.filter(b =>
+        b.filename.toLowerCase().includes(q) || b.summary.toLowerCase().includes(q));
+      const t = document.createElement('div');
+      t.className = 'section-title';
+      t.textContent = `Results · ${hits.length}`;
+      side.appendChild(t);
+      if (!hits.length) {
+        side.insertAdjacentHTML('beforeend', `<div class="empty">No matches for “${esc(q)}”.</div>`);
+        return;
+      }
+      hits.forEach(b => side.appendChild(bookButton(b, {showCat: true})));
+      return;
+    }
+
+    // Recent
+    if (RECENT.length) {
+      const t = document.createElement('div');
+      t.className = 'section-title';
+      t.textContent = 'Recent';
+      side.appendChild(t);
+      RECENT.forEach(rb => {
+        const full = BOOKS.find(b => b.id === rb.id) || rb;
+        side.appendChild(bookButton({...full, summary: full.summary || ''}, {showCat: true}));
+      });
+    }
+
+    // Categories
+    const cats = {};
+    for (const b of BOOKS) (cats[b.category] ||= []).push(b);
+    const names = Object.keys(cats).sort((a, b) => a.localeCompare(b));
+
+    const allTitle = document.createElement('div');
+    allTitle.className = 'section-title';
+    allTitle.innerHTML = '<span>Categories</span>' +
+      '<span class="actions">' +
+        '<button type="button" id="expandAll" title="Expand all">\u25bc</button>' +
+        '<button type="button" id="collapseAll" title="Collapse all">\u25b2</button>' +
+      '</span>';
+    // toggle every category in place — avoids a re-render (and the scroll jump)
+    const setAll = open => {
+      if (open) names.forEach(n => expanded.add(n)); else expanded.clear();
+      saveExpanded();
+      side.querySelectorAll('.cat-head').forEach(h => h.classList.toggle('collapsed', !open));
+      side.querySelectorAll('.cat-body').forEach(b => b.classList.toggle('hidden', !open));
+    };
+    allTitle.querySelector('#expandAll').addEventListener('click', () => setAll(true));
+    allTitle.querySelector('#collapseAll').addEventListener('click', () => setAll(false));
+    side.appendChild(allTitle);
+
+    for (const name of names) {
+      const wrap = document.createElement('div');
+      wrap.className = 'cat';
+      const isOpen = expanded.has(name);
+      const head = document.createElement('button');
+      head.className = 'cat-head' + (isOpen ? '' : ' collapsed');
+      head.innerHTML = `<span class="chev">▼</span><span>${esc(name)}</span>` +
+                       `<span class="badge">${cats[name].length}</span>`;
+      const body = document.createElement('div');
+      body.className = 'cat-body' + (isOpen ? '' : ' hidden');
+      cats[name].forEach(b => body.appendChild(bookButton(b)));
+      head.addEventListener('click', () => {
+        if (expanded.has(name)) expanded.delete(name); else expanded.add(name);
+        saveExpanded();
+        head.classList.toggle('collapsed');
+        body.classList.toggle('hidden');
+      });
+      wrap.appendChild(head);
+      wrap.appendChild(body);
+      side.appendChild(wrap);
+    }
+  }
+
+  $('#q').addEventListener('input', render);
+  $('#clear').addEventListener('click', () => { $('#q').value = ''; render(); $('#q').focus(); });
+
+  // ── resizable sidebar (draggable splitter, max 20% of screen) ──────────────
+  const sidebar = $('#sidebar');
+  const minW = () => Math.round(window.innerWidth * 0.15);
+  const maxW = () => Math.round(window.innerWidth * 0.50);
+  function setWidth(px, persist) {
+    px = Math.min(Math.max(px, minW()), maxW());
+    sidebar.style.width = px + 'px';
+    if (persist) store.set(KEY_W, String(px));
+  }
+  const savedW = parseInt(store.get(KEY_W), 10);
+  setWidth(Number.isFinite(savedW) ? savedW : maxW());   // restore, else 20% cap
+  window.addEventListener('resize', () => setWidth(sidebar.getBoundingClientRect().width, true));
+
+  const splitter = $('#splitter');
+  splitter.addEventListener('mousedown', e => {
+    e.preventDefault();
+    document.body.classList.add('resizing');
+    splitter.classList.add('dragging');
+    const left = sidebar.getBoundingClientRect().left;
+    const onMove = ev => setWidth(ev.clientX - left);
+    const onUp = () => {
+      setWidth(sidebar.getBoundingClientRect().width, true);  // persist final width
+      document.body.classList.remove('resizing');
+      splitter.classList.remove('dragging');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+
+  load().catch(e => { $('#sidebar').innerHTML = `<div class="empty">Failed to load: ${esc(String(e))}</div>`; });
+})();
+</script>
+</body>
+</html>
