@@ -1,4 +1,4 @@
-# Copy to .rename_books.toml and fill in your key.
+# Copy to .bookshelf.toml and fill in your key.
 # The OPENAI_API_KEY environment variable is used as a fallback.
 [openai]
 api_key = "sk-..."

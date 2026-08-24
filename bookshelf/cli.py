@@ -29,9 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     # not clobber a value given before the subcommand.
     common = argparse.ArgumentParser(add_help=False)
     for flag, meta, help_text in (
-        ("--db", "PATH", "Path to the catalog DB (default: .rename_books.db beside the app)"),
+        ("--db", "PATH", "Path to the catalog DB (default: .bookshelf.db beside the app)"),
         ("--root", "PATH", "Shelf root holding the category directories (default: data/)"),
-        ("--config", "PATH", "TOML config holding the API key (default: .rename_books.toml)"),
+        ("--config", "PATH", "TOML config holding the API key (default: .bookshelf.toml)"),
     ):
         common.add_argument(flag, metavar=meta, default=argparse.SUPPRESS, help=help_text)
 

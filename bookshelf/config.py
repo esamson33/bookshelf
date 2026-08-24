@@ -56,8 +56,8 @@ class Config:
         return cls(
             app_dir=APP_DIR,
             data_dir=APP_DIR / "data",
-            db_path=APP_DIR / ".rename_books.db",
-            config_file=APP_DIR / ".rename_books.toml",
+            db_path=APP_DIR / ".bookshelf.db",
+            config_file=APP_DIR / ".bookshelf.toml",
         )
 
     @classmethod
