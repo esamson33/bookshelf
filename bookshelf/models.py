@@ -1,0 +1,96 @@
+"""The proposal record shared by every mode.
+
+The original script passed untyped dicts around and overloaded
+`proposed_name`: for a shelved book it held "Title.pdf", but for a book still
+in the landing pad it held "Category/Title.pdf". That fiction was re-parsed at
+three separate call sites (splitting with Path().parent/.name, with
+.partition("/"), and re-joining with an f-string), and a missing key raised
+KeyError deep inside an apply loop.
+
+Proposal keeps the category as its own field. `db_value` reproduces the stored
+format exactly, so the on-disk schema is unchanged.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+PDF_SUFFIX = ".pdf"
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """One proposed rename or move.
+
+    `filename` is the destination name including its extension — stored
+    verbatim rather than rebuilt from a title, so a name like "Book v2.pdf"
+    round-trips through the DB unchanged. `category` is set only for books
+    being filed out of the landing pad.
+    """
+
+    original_name: str
+    filename: str
+    summary: str = ""
+    category: str | None = None
+
+    def __post_init__(self):
+        # summary is always a string: "" means "looked up, none available".
+        # A NULL summary means "never attempted" and belongs only to rows
+        # predating the column, which missing_summaries() picks up for
+        # backfill — a Proposal never writes one.
+        if self.summary is None:
+            object.__setattr__(self, "summary", "")
+
+    @property
+    def title(self) -> str:
+        """Display title — the filename without its extension."""
+        return Path(self.filename).stem
+
+    @property
+    def db_value(self) -> str:
+        """The `proposed_name` column value for this proposal."""
+        return f"{self.category}/{self.filename}" if self.category else self.filename
+
+    @property
+    def is_noop(self) -> bool:
+        """True when the file is already named correctly."""
+        return self.category is None and self.filename == self.original_name
+
+    def with_category(self, category: str) -> "Proposal":
+        return replace(self, category=category)
+
+    @classmethod
+    def from_title(
+        cls,
+        original_name: str,
+        title: str,
+        summary: str = "",
+        category: str | None = None,
+    ) -> "Proposal":
+        """Build from a looked-up title (no extension)."""
+        return cls(
+            original_name=original_name,
+            filename=f"{title}{PDF_SUFFIX}",
+            summary=summary or "",
+            category=category,
+        )
+
+    @classmethod
+    def from_db(
+        cls, original_name: str, proposed_name: str, summary: str = ""
+    ) -> "Proposal":
+        """Rebuild from a stored row, splitting off a category if present.
+
+        Filenames cannot contain '/', so the first separator — and there is at
+        most one — always divides category from filename.
+        """
+        category, sep, filename = (proposed_name or "").partition("/")
+        if not sep:
+            category, filename = None, category
+        return cls(
+            original_name=original_name,
+            filename=filename,
+            summary=summary or "",
+            category=category,
+        )

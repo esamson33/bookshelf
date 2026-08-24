@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bookshelf.catalog import Catalog, SCHEMA_VERSION, is_helper_dir
 from bookshelf.config import Config
+from bookshelf.models import Proposal
 
 LEGACY_DDL = """
 CREATE TABLE renames (
@@ -54,7 +55,7 @@ class MigrationTest(CatalogTestCase):
     def test_is_idempotent(self):
         cat = self.open()
         cat.migrate()
-        cat.stage("Networking", [{"original_name": "a.pdf", "proposed_name": "A.pdf"}])
+        cat.stage("Networking", [Proposal("a.pdf", "A.pdf")])
         self.assertEqual(cat.migrate(), SCHEMA_VERSION)
         self.assertEqual(len(cat.pending("Networking")), 1)
 
@@ -124,26 +125,25 @@ class QueryTest(CatalogTestCase):
 
     def test_stage_then_read_back_pending(self):
         self.cat.stage("Networking", [
-            {"original_name": "raw.pdf", "proposed_name": "Real.pdf", "summary": "s"},
+            Proposal("raw.pdf", "Real.pdf", "s"),
         ])
         self.assertEqual(self.cat.pending("Networking"), {"raw.pdf": ("Real.pdf", "s")})
         self.assertEqual(self.cat.applied_names("Networking"), set())
 
     def test_stage_applied_stamps_applied_at(self):
-        self.cat.stage("Networking", [{"original_name": "a.pdf", "proposed_name": "A.pdf"}],
+        self.cat.stage("Networking", [Proposal("a.pdf", "A.pdf")],
                        status="applied")
         self.assertEqual(self.cat.applied_names("Networking"), {"a.pdf"})
         (_, applied_at), = self.cat.applied_index().values()
         self.assertTrue(applied_at)
 
     def test_stage_upserts_on_conflict(self):
-        row = {"original_name": "a.pdf", "proposed_name": "First.pdf", "summary": "one"}
-        self.cat.stage("Networking", [row])
-        self.cat.stage("Networking", [{**row, "proposed_name": "Second.pdf", "summary": "two"}])
+        self.cat.stage("Networking", [Proposal("a.pdf", "First.pdf", "one")])
+        self.cat.stage("Networking", [Proposal("a.pdf", "Second.pdf", "two")])
         self.assertEqual(self.cat.pending("Networking"), {"a.pdf": ("Second.pdf", "two")})
 
     def test_mark_applied_moves_row_out_of_pending(self):
-        self.cat.stage("Networking", [{"original_name": "a.pdf", "proposed_name": "A.pdf"}])
+        self.cat.stage("Networking", [Proposal("a.pdf", "A.pdf")])
         self.cat.mark_applied("Networking", "a.pdf")
         self.cat.commit()
         self.assertEqual(self.cat.pending("Networking"), {})
@@ -151,7 +151,7 @@ class QueryTest(CatalogTestCase):
 
     def test_rekey_moves_landing_row_to_its_category(self):
         self.cat.stage("__landing", [
-            {"original_name": "raw.pdf", "proposed_name": "Networking/Real.pdf", "summary": "keep me"},
+            Proposal("raw.pdf", "Networking/Real.pdf", "keep me"),
         ])
         self.cat.rekey("__landing", "raw.pdf", "Networking", "Real.pdf")
         self.cat.commit()
@@ -161,8 +161,8 @@ class QueryTest(CatalogTestCase):
         self.assertEqual(self.cat.applied_index()[("Networking", "Real.pdf")][0] > 0, True)
 
     def test_clear_pending_leaves_applied_rows(self):
-        self.cat.stage("Networking", [{"original_name": "p.pdf", "proposed_name": "P.pdf"}])
-        self.cat.stage("Networking", [{"original_name": "a.pdf", "proposed_name": "A.pdf"}],
+        self.cat.stage("Networking", [Proposal("p.pdf", "P.pdf")])
+        self.cat.stage("Networking", [Proposal("a.pdf", "A.pdf")],
                        status="applied")
         self.assertEqual(self.cat.clear_pending("Networking"), 1)
         self.assertEqual(self.cat.applied_names("Networking"), {"a.pdf"})
@@ -172,16 +172,27 @@ class QueryTest(CatalogTestCase):
 
     def test_missing_summaries_only_covers_nulls(self):
         self.cat.stage("Networking", [
-            {"original_name": "a.pdf", "proposed_name": "A.pdf", "summary": None},
-            {"original_name": "b.pdf", "proposed_name": "B.pdf", "summary": ""},
-            {"original_name": "c.pdf", "proposed_name": "C.pdf", "summary": "have one"},
+            Proposal("b.pdf", "B.pdf", ""),
+            Proposal("c.pdf", "C.pdf", "have one"),
         ], status="applied")
+        # A NULL summary only arises on rows predating the column, so insert
+        # one directly — Proposal always writes a string.
+        self.cat._conn.execute(
+            "INSERT INTO renames (directory, original_name, proposed_name, status, summary) "
+            "VALUES ('Networking', 'a.pdf', 'A.pdf', 'applied', NULL)")
+        self.cat.commit()
         # "" means "asked, none available" — not retried.
         self.assertEqual([n for _, n in self.cat.missing_summaries()], ["A.pdf"])
 
+    def test_staged_proposals_never_leave_a_null_summary(self):
+        self.cat.stage("Networking", [Proposal("a.pdf", "A.pdf")], status="applied")
+        self.assertEqual(self.cat.missing_summaries(), [])
+
     def test_set_summaries_persists(self):
-        self.cat.stage("Networking", [{"original_name": "a.pdf", "proposed_name": "A.pdf"}],
-                       status="applied")
+        self.cat._conn.execute(
+            "INSERT INTO renames (directory, original_name, proposed_name, status, summary) "
+            "VALUES ('Networking', 'a.pdf', 'A.pdf', 'applied', NULL)")
+        self.cat.commit()
         row_id, _ = self.cat.missing_summaries()[0]
         self.cat.set_summaries([("filled in", row_id)])
         self.assertEqual(self.cat.missing_summaries(), [])
@@ -195,9 +206,9 @@ class ReaderTest(CatalogTestCase):
         self.cat.migrate()
         (self.data / "Networking").mkdir()
         (self.data / "Networking" / "Real.pdf").write_bytes(b"%PDF")
-        self.cat.stage("Networking", [{"original_name": "Real.pdf", "proposed_name": "Real.pdf"}],
+        self.cat.stage("Networking", [Proposal("Real.pdf", "Real.pdf")],
                        status="applied")
-        self.cat.stage("__landing", [{"original_name": "raw.pdf", "proposed_name": "raw.pdf"}],
+        self.cat.stage("__landing", [Proposal("raw.pdf", "raw.pdf")],
                        status="applied")
 
     def test_helper_dirs_excluded_from_listings(self):
@@ -229,7 +240,7 @@ class ReaderTest(CatalogTestCase):
     def test_book_path_blocks_traversal_outside_the_shelf(self):
         escape = (self.root / "secret.pdf")
         escape.write_bytes(b"%PDF")
-        self.cat.stage("../", [{"original_name": "secret.pdf", "proposed_name": "secret.pdf"}],
+        self.cat.stage("../", [Proposal("secret.pdf", "secret.pdf")],
                        status="applied")
         row_id = self.cat.applied_index()[("../", "secret.pdf")][0]
         self.assertIsNone(self.cat.book_path(row_id))

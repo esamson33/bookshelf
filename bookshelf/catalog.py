@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .config import Config
+from .models import Proposal
 
 SCHEMA_VERSION = 3
 
@@ -174,8 +175,14 @@ class Catalog:
 
     # ── writes ───────────────────────────────────────────────────────────
 
-    def stage(self, key: str, proposals: Sequence[dict], status: str = "pending") -> None:
-        """Upsert proposals for `key`, stamping applied_at when applied."""
+    def stage(
+        self, key: str, proposals: Sequence["Proposal"], status: str = "pending"
+    ) -> None:
+        """Upsert proposals for `key`, stamping applied_at when applied.
+
+        `db_value` reproduces the legacy `proposed_name` format, including the
+        "Category/Title.pdf" form used while a book sits in the landing pad.
+        """
         with self._lock:
             for p in proposals:
                 self._conn.execute(
@@ -190,8 +197,10 @@ class Catalog:
                         status        = excluded.status,
                         applied_at    = excluded.applied_at
                     """,
-                    (key, p["original_name"], p["proposed_name"],
-                     p.get("summary"), status, status),
+                    # summary is stored verbatim: "" means "looked up, none
+                    # available" and must stay distinct from NULL, which
+                    # missing_summaries() treats as "never attempted".
+                    (key, p.original_name, p.db_value, p.summary, status, status),
                 )
             self._conn.commit()
 

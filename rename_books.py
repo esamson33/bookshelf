@@ -47,7 +47,15 @@ from pathlib import Path
 from bookshelf.catalog import Catalog
 from bookshelf.config import Config, ConfigError
 from bookshelf.lookup import LookupClient
+from bookshelf.models import Proposal
 from bookshelf.render import table, truncate
+from bookshelf.scan import (
+    categories,
+    collect_pdfs,
+    pdf_names,
+    reconcile,
+    sample_titles,
+)
 
 # ── config ─────────────────────────────────────────────────────────────────
 # Paths now come from bookshelf.config.Config rather than module constants, so
@@ -65,20 +73,20 @@ def batch_progress(index: int, total: int, size: int) -> None:
     print(f"  Batch {index}/{total} ({size} books)…")
 
 
-def apply_renames(directory: str, proposals: list[dict]) -> tuple[int, int]:
+def apply_renames(directory: Path, proposals: list[Proposal]) -> tuple[int, int]:
     dir_path = Path(directory)
     key      = CATALOG.key(dir_path)
     success = errors = 0
     for p in proposals:
-        src = dir_path / p["original_name"]
-        dst = dir_path / p["proposed_name"]
+        src = dir_path / p.original_name
+        dst = dir_path / p.filename
         if dst.exists():
             print(f"  Skipping — destination already exists: {dst.name}")
             errors += 1
             continue
         try:
             src.rename(dst)
-            CATALOG.mark_applied(key, p["original_name"])
+            CATALOG.mark_applied(key, p.original_name)
             success += 1
         except OSError as e:
             print(f"  Error renaming '{src.name}': {e}")
@@ -87,21 +95,19 @@ def apply_renames(directory: str, proposals: list[dict]) -> tuple[int, int]:
     return success, errors
 
 
-def apply_moves(landing_dir: Path, root: Path, proposals: list[dict]) -> tuple[int, int]:
-    """Move files from landing_dir into root/<category>/<title>.pdf."""
+def apply_moves(landing_dir: Path, root: Path, proposals: list[Proposal]) -> tuple[int, int]:
+    """Move files from landing_dir into root/<category>/<filename>."""
     key     = CATALOG.key(landing_dir)
     success = errors = 0
     for p in proposals:
-        src     = landing_dir / p["original_name"]
-        # proposed_name encodes "Category/Title.pdf"
-        rel     = Path(p["proposed_name"])
-        dst_dir = root / rel.parent
-        dst     = dst_dir / rel.name
+        src     = landing_dir / p.original_name
+        dst_dir = root / p.category
+        dst     = dst_dir / p.filename
 
         dst_dir.mkdir(exist_ok=True)
 
         if dst.exists():
-            print(f"  Skipping — destination already exists: {rel}")
+            print(f"  Skipping — destination already exists: {p.db_value}")
             errors += 1
             continue
         try:
@@ -109,7 +115,7 @@ def apply_moves(landing_dir: Path, root: Path, proposals: list[dict]) -> tuple[i
             # Re-key the record to its destination so it becomes an ordinary
             # shelved row (directory = category, proposed_name = title). This
             # leaves no leftover '__landing' rows while preserving the summary.
-            CATALOG.rekey(key, p["original_name"], CATALOG.key(dst_dir), dst.name)
+            CATALOG.rekey(key, p.original_name, CATALOG.key(dst_dir), dst.name)
             success += 1
         except OSError as e:
             print(f"  Error moving '{src.name}': {e}")
@@ -189,27 +195,9 @@ def apply_dedupe(
     return deleted, errors
 
 
-# ── shelf scanning ─────────────────────────────────────────────────────────
-
-def sample_category_books(root: Path, categories: list[str], n: int = 5) -> dict[str, list[str]]:
-    """Return {category: [title_stem, ...]} by reading PDFs already in each category dir."""
-    samples: dict[str, list[str]] = {}
-    for cat in categories:
-        cat_dir = root / cat
-        if cat_dir.is_dir():
-            books = sorted(
-                Path(f).stem for f in os.listdir(cat_dir)
-                if f.lower().endswith(".pdf")
-            )
-            samples[cat] = books[:n]
-        else:
-            samples[cat] = []
-    return samples
-
-
 # ── display ────────────────────────────────────────────────────────────────
 
-def show_preview(groups: list[tuple[Path, list[dict]]], root: Path):
+def show_preview(groups: list[tuple[Path, list[Proposal]]], root: Path):
     """
     groups: list of (directory, proposals) pairs.
     Shows a directory header before each group when there is more than one.
@@ -224,16 +212,16 @@ def show_preview(groups: list[tuple[Path, list[dict]]], root: Path):
                 label = directory
             print(f"\n{label}/")
         rows = [
-            (counter + i, p["original_name"], p["proposed_name"], truncate(p.get("summary") or ""))
+            (counter + i, p.original_name, p.filename, truncate(p.summary))
             for i, p in enumerate(proposals)
         ]
         counter += len(proposals)
         print(table(rows, ["#", "Original", "Renamed to", "Description"], detail_last=True))
 
 
-def show_landing_preview(proposals: list[dict]):
+def show_landing_preview(proposals: list[Proposal]):
     rows = [
-        (i + 1, p["original_name"], p["category"], p["display_name"], truncate(p.get("summary") or ""))
+        (i + 1, p.original_name, p.category, p.filename, truncate(p.summary))
         for i, p in enumerate(proposals)
     ]
     print(table(rows, ["#", "Original", "Category", "Renamed to", "Description"], detail_last=True))
@@ -271,27 +259,6 @@ def show_dedupe_preview(groups: list[dict], stale: list[tuple[int, str, str]], r
 
 
 # ── main ───────────────────────────────────────────────────────────────────
-
-def collect_pdfs(root: Path, recursive: bool) -> list[tuple[Path, list[str]]]:
-    """
-    Returns a list of (directory, [pdf_filenames]) pairs.
-    In non-recursive mode returns only the root; in recursive mode walks all subdirs.
-    """
-    if not recursive:
-        pdfs = sorted(
-            f.name for f in root.iterdir()
-            if f.is_file() and f.suffix.lower() == ".pdf"
-        )
-        return [(root, pdfs)] if pdfs else []
-
-    results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort()
-        pdfs = sorted(f for f in filenames if f.lower().endswith(".pdf"))
-        if pdfs:
-            results.append((Path(dirpath), pdfs))
-    return results
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -406,18 +373,12 @@ def main():
     if args.new:
         LANDING_DIR.mkdir(parents=True, exist_ok=True)
 
-        all_pdfs = sorted(
-            f.name for f in LANDING_DIR.iterdir()
-            if f.is_file() and f.suffix.lower() == ".pdf"
-        )
+        all_pdfs = pdf_names(LANDING_DIR)
         if not all_pdfs:
             print(f"No PDF files in {LANDING_DIR.name}/.")
             sys.exit(0)
 
-        existing_categories = sorted(
-            d.name for d in DATA_DIR.iterdir()
-            if d.is_dir() and not d.name.startswith((".", "_"))
-        )
+        existing_categories = categories(DATA_DIR)
 
         forced_category = args.category.strip()
 
@@ -426,30 +387,18 @@ def main():
             if cleared:
                 print(f"Cleared {cleared} previously proposed move(s); starting fresh.")
 
-        applied       = CATALOG.applied_names(CATALOG.key(LANDING_DIR))
-        pending       = CATALOG.pending(CATALOG.key(LANDING_DIR))
-        total_skipped = sum(1 for f in all_pdfs if f in applied)
+        found = reconcile(CATALOG, LANDING_DIR, all_pdfs)
+        total_skipped = found.applied
 
-        pending_here: list[dict] = []
-        for f in all_pdfs:
-            if f in pending:
-                prop_name, summary = pending[f]
-                category, _, title_file = prop_name.partition("/")
-                # A forced --category overrides the category stored on a pending
-                # proposal, so the whole batch is filed consistently.
-                if forced_category:
-                    category  = forced_category
-                    prop_name = f"{forced_category}/{title_file}"
-                pending_here.append({
-                    "original_name": f,
-                    "proposed_name": prop_name,
-                    "category":      category,
-                    "display_name":  title_file,
-                    "summary":       summary,
-                })
+        # A forced --category overrides the category stored on a pending
+        # proposal, so the whole batch is filed consistently.
+        pending_here = [
+            p.with_category(forced_category) if forced_category else p
+            for p in found.pending
+        ]
 
-        new_files = [f for f in all_pdfs if f not in applied and f not in pending]
-        move_proposals: list[dict] = list(pending_here)
+        new_files = found.unknown
+        move_proposals: list[Proposal] = list(pending_here)
 
         if pending_here:
             print(f"Re-showing {len(pending_here)} previously proposed move(s).")
@@ -457,7 +406,7 @@ def main():
         if new_files:
             if total_skipped:
                 print(f"Skipping {total_skipped} already-applied file(s).")
-            stems = [Path(f).stem for f in new_files]
+            stems = found.stems
 
             if forced_category:
                 print(f"Looking up titles for {len(new_files)} new file(s); "
@@ -465,7 +414,7 @@ def main():
                 results = LOOKUP.titles(stems, args.publisher)
             else:
                 print(f"Looking up titles and categories for {len(new_files)} new file(s)…\n")
-                category_samples = sample_category_books(DATA_DIR, existing_categories)
+                category_samples = sample_titles(DATA_DIR, existing_categories)
                 results          = LOOKUP.categorized_titles(
                     stems, existing_categories, category_samples)
 
@@ -478,16 +427,13 @@ def main():
             summary_map  = {r["original"]: r.get("summary", "")          for r in results}
 
             for fname in new_files:
-                stem     = Path(fname).stem
-                title    = title_map.get(stem, stem)
-                category = forced_category or category_map.get(stem, "Uncategorized")
-                move_proposals.append({
-                    "original_name": fname,
-                    "proposed_name": f"{category}/{title}.pdf",
-                    "category":      category,
-                    "display_name":  f"{title}.pdf",
-                    "summary":       summary_map.get(stem, ""),
-                })
+                stem = Path(fname).stem
+                move_proposals.append(Proposal.from_title(
+                    original_name=fname,
+                    title=title_map.get(stem, stem),
+                    summary=summary_map.get(stem, ""),
+                    category=forced_category or category_map.get(stem, "Uncategorized"),
+                ))
         elif not pending_here:
             print(f"All {total_skipped} file(s) already applied. Nothing to do.")
             sys.exit(0)
@@ -509,12 +455,13 @@ def main():
                 idx = int(answer) - 1
                 if 0 <= idx < len(move_proposals):
                     p = move_proposals[idx]
-                    print(f"  Book     : {p['display_name']}")
-                    print(f"  Category : {p['category']}")
+                    print(f"  Book     : {p.filename}")
+                    print(f"  Category : {p.category}")
                     new_cat = input("  New category: ").strip()
                     if new_cat:
-                        p["category"]      = new_cat
-                        p["proposed_name"] = f"{new_cat}/{p['display_name']}"
+                        # Proposal is frozen — replace the entry rather than
+                        # mutating it, so db_value stays consistent.
+                        move_proposals[idx] = p.with_category(new_cat)
                 else:
                     print(f"  Invalid row number — enter 1–{len(move_proposals)}.")
             else:
@@ -542,29 +489,23 @@ def main():
         sys.exit(0)
 
     new_groups:     list[tuple[Path, list[str]]] = []
-    pending_groups: list[tuple[Path, list[dict]]] = []
+    pending_groups: list[tuple[Path, list[Proposal]]] = []
     total_skipped = 0
 
     for directory, all_pdfs in dir_groups:
-        applied  = CATALOG.applied_names(CATALOG.key(directory))
-        pending  = CATALOG.pending(CATALOG.key(directory))
-        total_skipped += len([f for f in all_pdfs if f in applied])
+        found = reconcile(CATALOG, directory, all_pdfs)
+        total_skipped += found.applied
 
-        # Files with a saved pending proposal — re-surface without API call
-        pending_here = [
-            {"original_name": f, "proposed_name": pending[f][0], "summary": pending[f][1]}
-            for f in all_pdfs if f in pending
-        ]
-        if pending_here:
-            pending_groups.append((directory, pending_here))
+        # Files with a saved pending proposal — re-surface without an API call
+        if found.pending:
+            pending_groups.append((directory, found.pending))
 
         # Truly new files — not applied and not pending
-        new_files = [f for f in all_pdfs if f not in applied and f not in pending]
-        if new_files:
-            new_groups.append((directory, new_files))
+        if found.unknown:
+            new_groups.append((directory, found.unknown))
 
     # ── look up new files via OpenAI ──────────────────────────────────────
-    rename_groups: list[tuple[Path, list[dict]]] = []
+    rename_groups: list[tuple[Path, list[Proposal]]] = []
 
     # Re-add pending groups first (already have proposals, no API needed)
     rename_groups.extend(pending_groups)
@@ -589,20 +530,19 @@ def main():
         summary_map = {r["original"]: r.get("summary", "") for r in results}
 
         # ── split into already-correct vs. needs rename ───────────────────
-        already_correct: list[tuple[Path, list[dict]]] = []
+        already_correct: list[tuple[Path, list[Proposal]]] = []
 
         for directory, files in new_groups:
             correct   = []
             to_rename = []
             for fname in files:
                 stem     = Path(fname).stem
-                title    = title_map.get(stem, stem)
-                proposal = {
-                    "original_name": fname,
-                    "proposed_name": title + ".pdf",
-                    "summary":       summary_map.get(stem, ""),
-                }
-                if title + ".pdf" == fname:
+                proposal = Proposal.from_title(
+                    original_name=fname,
+                    title=title_map.get(stem, stem),
+                    summary=summary_map.get(stem, ""),
+                )
+                if proposal.is_noop:
                     correct.append(proposal)
                 else:
                     to_rename.append(proposal)
@@ -642,7 +582,7 @@ def main():
     # ── apply ─────────────────────────────────────────────────────────────
     total_ok = total_err = 0
     for directory, proposals in rename_groups:
-        ok, err = apply_renames(str(directory), proposals)
+        ok, err = apply_renames(directory, proposals)
         total_ok  += ok
         total_err += err
 
