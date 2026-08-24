@@ -41,39 +41,28 @@ under data/. DB `directory` keys are stored relative to data/.
 
 import os
 import sys
-import json
 import argparse
 from pathlib import Path
 
 from bookshelf.catalog import Catalog
 from bookshelf.config import Config, ConfigError
+from bookshelf.lookup import LookupClient
 from bookshelf.render import table, truncate
-
-# ── OpenAI ─────────────────────────────────────────────────────────────────
-try:
-    from openai import OpenAI
-except ImportError:
-    print("Error: 'openai' package not found. Run: pip install openai")
-    sys.exit(1)
 
 # ── config ─────────────────────────────────────────────────────────────────
 # Paths now come from bookshelf.config.Config rather than module constants, so
-# they can be pointed elsewhere by tests and by --db / --root. CATALOG is set
-# up in main() and holds every query plus the schema.
+# they can be pointed elsewhere by tests and by --db / --root. CATALOG and
+# LOOKUP are set up in main().
 CONFIG      = Config.default()
 DATA_DIR    = CONFIG.data_dir
 LANDING_DIR = CONFIG.landing_dir
-MODEL       = CONFIG.model
 
-CATALOG: Catalog = None  # type: ignore
+CATALOG: Catalog = None      # type: ignore
+LOOKUP:  LookupClient = None  # type: ignore
 
 
-def load_api_key() -> str:
-    try:
-        return CONFIG.api_key()
-    except ConfigError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+def batch_progress(index: int, total: int, size: int) -> None:
+    print(f"  Batch {index}/{total} ({size} books)…")
 
 
 def apply_renames(directory: str, proposals: list[dict]) -> tuple[int, int]:
@@ -200,104 +189,7 @@ def apply_dedupe(
     return deleted, errors
 
 
-# ── API helpers ────────────────────────────────────────────────────────────
-
-SUMMARY_BATCH_SIZE = 20
-
-
-def _lookup_summaries_batch(client: OpenAI, titles: list[str]) -> dict[str, str]:
-    """Fetch summaries for one batch of titles. Returns {title: summary}."""
-    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titles))
-
-    prompt = f"""\
-For each book title below, search the web and write a one-sentence summary (max 200 words).
-
-Titles:
-{numbered}
-
-Return ONLY a valid JSON array — no markdown fences, no explanation. Schema:
-[{{"title": "<Exact Title As Given>", "summary": "<One sentence, max 200 words>"}}]
-"""
-
-    response = client.responses.create(
-        model=MODEL,
-        tools=[{"type": "web_search_preview"}],
-        input=prompt,
-    )
-
-    text  = response.output_text.strip()
-    start = text.find("[")
-    end   = text.rfind("]") + 1
-    if start != -1 and end > start:
-        try:
-            results = json.loads(text[start:end])
-            return {r["title"]: r["summary"] for r in results}
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    return {}
-
-
-def lookup_summaries(titles: list[str]) -> dict[str, str]:
-    """
-    Given a list of proper book titles (no extension), return {title: summary}.
-    Batches requests to stay within token limits.
-    """
-    client  = OpenAI(api_key=load_api_key())
-    results = {}
-    batches = [titles[i:i + SUMMARY_BATCH_SIZE] for i in range(0, len(titles), SUMMARY_BATCH_SIZE)]
-
-    for idx, batch in enumerate(batches, 1):
-        print(f"  Batch {idx}/{len(batches)} ({len(batch)} books)…")
-        results.update(_lookup_summaries_batch(client, batch))
-
-    return results
-
-
-def lookup_titles(stems: list[str], publisher_hint: str) -> list[dict]:
-    """
-    Ask GPT-4o (with web search) to resolve each stem to a proper book title.
-    Returns a list of {"original": stem, "title": "Proper Title"}.
-    """
-    client = OpenAI(api_key=load_api_key())
-
-    hint = (
-        f"These are books published by {publisher_hint}."
-        if publisher_hint
-        else "Publishers may include Packt, O'Reilly, Manning, No Starch Press, or others."
-    )
-
-    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(stems))
-
-    prompt = f"""\
-I have PDF book filenames (stems only, no extension) that need their proper published titles.
-{hint}
-Search the web to find the exact, properly-cased title for each one.
-
-Filenames:
-{numbered}
-
-Return ONLY a valid JSON array — no markdown fences, no explanation. Schema:
-[{{"original": "<stem>", "title": "<Exact Published Title>", "summary": "<One sentence, max 200 words>"}}]
-"""
-
-    response = client.responses.create(
-        model=MODEL,
-        tools=[{"type": "web_search_preview"}],
-        input=prompt,
-    )
-
-    text = response.output_text.strip()
-    start = text.find("[")
-    end   = text.rfind("]") + 1
-    if start != -1 and end > start:
-        try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
-
-    return []
-
+# ── shelf scanning ─────────────────────────────────────────────────────────
 
 def sample_category_books(root: Path, categories: list[str], n: int = 5) -> dict[str, list[str]]:
     """Return {category: [title_stem, ...]} by reading PDFs already in each category dir."""
@@ -313,63 +205,6 @@ def sample_category_books(root: Path, categories: list[str], n: int = 5) -> dict
         else:
             samples[cat] = []
     return samples
-
-
-def lookup_categorized_titles(
-    stems: list[str],
-    existing_categories: list[str],
-    category_samples: dict[str, list[str]] | None = None,
-) -> list[dict]:
-    """
-    Like lookup_titles but also assigns each book to a category.
-    Returns a list of {"original": stem, "title": ..., "category": ..., "summary": ...}.
-    """
-    client = OpenAI(api_key=load_api_key())
-
-    cat_lines = []
-    for cat in sorted(existing_categories):
-        books = (category_samples or {}).get(cat, [])
-        if books:
-            examples = ", ".join(f'"{b}"' for b in books)
-            cat_lines.append(f'- {cat} (e.g. {examples})')
-        else:
-            cat_lines.append(f"- {cat}")
-    cat_list = "\n".join(cat_lines)
-
-    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(stems))
-
-    prompt = f"""\
-I have PDF book filenames (stems only, no extension) that need their proper published titles and subject categories.
-Search the web to find the exact, properly-cased title for each one.
-
-Existing categories with representative books already shelved in each:
-{cat_list}
-
-Use the example books as anchors to pick the most appropriate existing category for each new book. If none fit well, propose a short new category name.
-
-Filenames:
-{numbered}
-
-Return ONLY a valid JSON array — no markdown fences, no explanation. Schema:
-[{{"original": "<stem>", "title": "<Exact Published Title>", "category": "<Category Name>", "summary": "<One sentence, max 200 words>"}}]
-"""
-
-    response = client.responses.create(
-        model=MODEL,
-        tools=[{"type": "web_search_preview"}],
-        input=prompt,
-    )
-
-    text  = response.output_text.strip()
-    start = text.find("[")
-    end   = text.rfind("]") + 1
-    if start != -1 and end > start:
-        try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
-
-    return []
 
 
 # ── display ────────────────────────────────────────────────────────────────
@@ -516,14 +351,14 @@ def main():
     if args.fresh and not args.new:
         parser.error("--fresh only applies together with --new")
 
-    global CONFIG, DATA_DIR, LANDING_DIR, MODEL, CATALOG
+    global CONFIG, DATA_DIR, LANDING_DIR, CATALOG, LOOKUP
     CONFIG      = Config.from_args(args)
     DATA_DIR    = CONFIG.data_dir
     LANDING_DIR = CONFIG.landing_dir
-    MODEL       = CONFIG.model
 
     CATALOG = Catalog(CONFIG)
     CATALOG.migrate()
+    LOOKUP = LookupClient(CONFIG)
 
     # ── backfill-summaries mode ───────────────────────────────────────────
     if args.backfill_summaries:
@@ -533,7 +368,7 @@ def main():
             sys.exit(0)
         print(f"Fetching summaries for {len(missing)} book(s)…\n")
         titles    = [Path(proposed_name).stem for _, proposed_name in missing]
-        title_map = lookup_summaries(titles)
+        title_map = LOOKUP.summaries(titles, progress=batch_progress)
         # Save all rows the API responded to (even "" = unavailable).
         # Rows not in title_map stay NULL and will be retried next run.
         updates = [
@@ -627,11 +462,12 @@ def main():
             if forced_category:
                 print(f"Looking up titles for {len(new_files)} new file(s); "
                       f"filing all into '{forced_category}'…\n")
-                results = lookup_titles(stems, args.publisher)
+                results = LOOKUP.titles(stems, args.publisher)
             else:
                 print(f"Looking up titles and categories for {len(new_files)} new file(s)…\n")
                 category_samples = sample_category_books(DATA_DIR, existing_categories)
-                results          = lookup_categorized_titles(stems, existing_categories, category_samples)
+                results          = LOOKUP.categorized_titles(
+                    stems, existing_categories, category_samples)
 
             if not results:
                 print("Could not retrieve titles. Check your OPENAI_API_KEY and try again.")
@@ -743,7 +579,7 @@ def main():
         print(f"Looking up titles for {total_new} new file(s)…\n")
 
         all_stems = [Path(f).stem for _, files in new_groups for f in files]
-        results   = lookup_titles(all_stems, args.publisher)
+        results   = LOOKUP.titles(all_stems, args.publisher)
 
         if not results:
             print("Could not retrieve titles from OpenAI. Check your OPENAI_API_KEY and try again.")
@@ -814,4 +650,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ConfigError as e:
+        # Missing API key, or the openai package not installed. Both used to
+        # be caught eagerly at import; they now surface only when a lookup is
+        # actually attempted, so modes that never call the API still run.
+        print(f"Error: {e}")
+        sys.exit(1)
