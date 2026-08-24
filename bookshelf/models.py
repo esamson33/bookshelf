@@ -94,3 +94,32 @@ class Proposal:
             summary=summary or "",
             category=category,
         )
+
+
+@dataclass(frozen=True)
+class Duplicate:
+    """One filename found in more than one category directory.
+
+    `keep` is the copy with the earliest applied_at (untracked copies sort
+    last); `remove` are the rest. `remove_db_ids` covers only those copies
+    that actually have a catalog row — a duplicate can exist on disk with no
+    row at all.
+    """
+
+    filename: str
+    keep: Path
+    remove: tuple[Path, ...]
+    remove_db_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class StaleRow:
+    """An applied catalog row whose file is no longer on disk."""
+
+    row_id: int
+    directory: str
+    proposed_name: str
+
+    @property
+    def path(self) -> Path:
+        return Path(self.directory) / self.proposed_name
