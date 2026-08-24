@@ -120,9 +120,9 @@ def build(ctx: Context) -> DedupePlan:
 
     on_disk = {str(p) for paths in by_name.values() for p in paths}
     stale = [
-        StaleRow(row_id, directory, proposed_name)
-        for (directory, proposed_name), (row_id, _) in index.items()
-        if str(Path(directory) / proposed_name) not in on_disk
+        StaleRow(row_id, directory, filename)
+        for (directory, filename), (row_id, _) in index.items()
+        if str(Path(directory) / filename) not in on_disk
     ]
 
     return DedupePlan(duplicates, stale, root, tracked=set(index))

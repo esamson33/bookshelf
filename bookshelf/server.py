@@ -78,7 +78,7 @@ def book_info(book_id: int) -> dict | None:
     return {
         "id":            row["id"],
         "category":      row["directory"],
-        "filename":      row["proposed_name"],
+        "filename":      row["filename"],
         "original_name": row["original_name"],
         "summary":       row["summary"] or "",
         "applied_at":    row["applied_at"],

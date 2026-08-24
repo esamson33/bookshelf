@@ -1,7 +1,7 @@
 """The proposal record shared by every mode.
 
 The original script passed untyped dicts around and overloaded
-`proposed_name`: for a shelved book it held "Title.pdf", but for a book still
+the stored name column: for a shelved book it held "Title.pdf", but for one still
 in the landing pad it held "Category/Title.pdf". That fiction was re-parsed at
 three separate call sites (splitting with Path().parent/.name, with
 .partition("/"), and re-joining with an f-string), and a missing key raised
@@ -49,7 +49,7 @@ class Proposal:
 
     @property
     def db_value(self) -> str:
-        """The `proposed_name` column value for this proposal."""
+        """The `filename` column value for this proposal."""
         return f"{self.category}/{self.filename}" if self.category else self.filename
 
     @property
@@ -78,14 +78,14 @@ class Proposal:
 
     @classmethod
     def from_db(
-        cls, original_name: str, proposed_name: str, summary: str = ""
+        cls, original_name: str, stored_name: str, summary: str = ""
     ) -> "Proposal":
         """Rebuild from a stored row, splitting off a category if present.
 
         Filenames cannot contain '/', so the first separator — and there is at
         most one — always divides category from filename.
         """
-        category, sep, filename = (proposed_name or "").partition("/")
+        category, sep, filename = (stored_name or "").partition("/")
         if not sep:
             category, filename = None, category
         return cls(
@@ -118,8 +118,8 @@ class StaleRow:
 
     row_id: int
     directory: str
-    proposed_name: str
+    filename: str
 
     @property
     def path(self) -> Path:
-        return Path(self.directory) / self.proposed_name
+        return Path(self.directory) / self.filename

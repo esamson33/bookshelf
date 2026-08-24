@@ -1,5 +1,5 @@
 """Proposal: the record that replaced untyped dicts and the
-"Category/Title.pdf" overload of proposed_name."""
+"Category/Title.pdf" overload of the stored name column."""
 
 import unittest
 
@@ -20,9 +20,9 @@ class DbValueTest(unittest.TestCase):
 
 
 class RoundTripTest(unittest.TestCase):
-    def assert_round_trips(self, proposed_name):
-        p = Proposal.from_db("raw.pdf", proposed_name, "s")
-        self.assertEqual(p.db_value, proposed_name)
+    def assert_round_trips(self, stored_name):
+        p = Proposal.from_db("raw.pdf", stored_name, "s")
+        self.assertEqual(p.db_value, stored_name)
 
     def test_bare_filename(self):
         self.assert_round_trips("Real Title.pdf")

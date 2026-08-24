@@ -233,10 +233,10 @@ class DedupePlanTest(PlanTestCase):
         self.touch("Networking/dup.pdf")
         self.touch("Systems/dup.pdf")
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, applied_at)"
+            "INSERT INTO books (directory, original_name, filename, status, applied_at)"
             " VALUES ('Networking','dup.pdf','dup.pdf','applied','2026-01-01 00:00:00')")
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, applied_at)"
+            "INSERT INTO books (directory, original_name, filename, status, applied_at)"
             " VALUES ('Systems','dup.pdf','dup.pdf','applied','2026-06-01 00:00:00')")
         self.cat.commit()
 
@@ -248,7 +248,7 @@ class DedupePlanTest(PlanTestCase):
         self.touch("Networking/dup.pdf")
         self.touch("Systems/dup.pdf")
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, applied_at)"
+            "INSERT INTO books (directory, original_name, filename, status, applied_at)"
             " VALUES ('Systems','dup.pdf','dup.pdf','applied','2026-06-01 00:00:00')")
         self.cat.commit()
 
@@ -273,7 +273,7 @@ class DedupePlanTest(PlanTestCase):
     def test_stale_rows_are_found(self):
         self.cat.stage("Networking", [Proposal("gone.pdf", "gone.pdf")], status="applied")
         plan = dedupe_plan.build(self.context())
-        self.assertEqual([s.proposed_name for s in plan.stale], ["gone.pdf"])
+        self.assertEqual([s.filename for s in plan.stale], ["gone.pdf"])
 
     def test_helper_directories_are_not_scanned(self):
         self.touch("__landing/dup.pdf")
@@ -284,7 +284,7 @@ class DedupePlanTest(PlanTestCase):
         self.touch("Networking/dup.pdf")
         self.touch("Systems/dup.pdf")
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, applied_at)"
+            "INSERT INTO books (directory, original_name, filename, status, applied_at)"
             " VALUES ('Systems','dup.pdf','dup.pdf','applied','2026-06-01 00:00:00')")
         self.cat.commit()
         plan = dedupe_plan.build(self.context())
@@ -307,7 +307,7 @@ class SummaryPlanTest(PlanTestCase):
 
     def test_fills_in_what_the_model_returns(self):
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, summary)"
+            "INSERT INTO books (directory, original_name, filename, status, summary)"
             " VALUES ('Networking','A.pdf','A.pdf','applied',NULL)")
         self.cat.commit()
         lookup = StubLookup(summaries={"A": "the summary"})
@@ -321,7 +321,7 @@ class SummaryPlanTest(PlanTestCase):
 
     def test_rows_the_model_skipped_stay_null_for_a_later_retry(self):
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, summary)"
+            "INSERT INTO books (directory, original_name, filename, status, summary)"
             " VALUES ('Networking','A.pdf','A.pdf','applied',NULL)")
         self.cat.commit()
         plan = summaries_plan.build(self.context(StubLookup(summaries={})))
@@ -333,7 +333,7 @@ class SummaryPlanTest(PlanTestCase):
 
     def test_empty_summary_is_stored_so_it_is_not_retried(self):
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, summary)"
+            "INSERT INTO books (directory, original_name, filename, status, summary)"
             " VALUES ('Networking','A.pdf','A.pdf','applied',NULL)")
         self.cat.commit()
         plan = summaries_plan.build(self.context(StubLookup(summaries={"A": ""})))

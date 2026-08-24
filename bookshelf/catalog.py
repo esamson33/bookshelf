@@ -17,7 +17,7 @@ from typing import Iterable, Sequence
 from .config import Config
 from .models import Proposal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Timestamp expression for applied_at / accessed_at writes.
 #
@@ -28,7 +28,9 @@ SCHEMA_VERSION = 3
 # the web UI, or timestamps there would shift.
 NOW_SQL = "datetime('now', 'localtime')"
 
-TABLE = "renames"
+TABLE = "books"
+#: Pre-v4 name. A catalog is a list of books; only some rows describe a rename.
+LEGACY_TABLE = "renames"
 
 #: Helper directories (e.g. __landing) are staging areas, not categories.
 #: Expressed in SQL so the filter runs before ORDER BY / LIMIT.
@@ -69,41 +71,63 @@ class Catalog:
         self.close()
 
     def migrate(self) -> int:
-        """Bring the DB up to SCHEMA_VERSION. Idempotent.
+        """Bring the DB up to SCHEMA_VERSION. Returns the version found.
 
-        Each step is also guarded by an existence check, so a DB that already
-        has the right shape but no version stamp (as pre-refactor DBs do)
-        passes straight through and is simply stamped.
+        Every step is driven by the DB's actual shape rather than by the
+        version stamp alone, because pre-refactor DBs carry no stamp at all
+        while already having most of the schema. Running twice is a no-op.
         """
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            table = self._existing_table()
 
-            if version < 1:
+            if table is None:
+                # Fresh DB — create the current shape outright.
                 self._conn.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {TABLE} (
+                    CREATE TABLE {TABLE} (
                         id            INTEGER PRIMARY KEY AUTOINCREMENT,
                         directory     TEXT NOT NULL,
                         original_name TEXT NOT NULL,
-                        proposed_name TEXT,
+                        filename      TEXT,
                         status        TEXT NOT NULL DEFAULT 'pending',
                         created_at    TEXT NOT NULL DEFAULT (datetime('now')),
                         applied_at    TEXT,
+                        summary       TEXT,
+                        accessed_at   TEXT,
                         UNIQUE(directory, original_name)
                     )
                 """)
+            else:
+                columns = self._columns(table)
+                if "summary" not in columns:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN summary TEXT")
+                if "accessed_at" not in columns:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN accessed_at TEXT")
 
-            existing = self._columns()
-            if version < 2 and "summary" not in existing:
-                self._conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN summary TEXT")
-            if version < 3 and "accessed_at" not in existing:
-                self._conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN accessed_at TEXT")
+                # v4: the table is a catalog of books, and for a shelved book
+                # the column is simply its filename — "proposed" only holds
+                # while a row is still pending.
+                if table == LEGACY_TABLE:
+                    self._conn.execute(
+                        f"ALTER TABLE {LEGACY_TABLE} RENAME TO {TABLE}")
+                if "proposed_name" in self._columns(TABLE):
+                    self._conn.execute(
+                        f"ALTER TABLE {TABLE} RENAME COLUMN proposed_name TO filename")
 
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
             return version
 
-    def _columns(self) -> set[str]:
-        return {r[1] for r in self._conn.execute(f"PRAGMA table_info({TABLE})")}
+    def _existing_table(self) -> str | None:
+        """Whichever of the two table names this DB currently uses."""
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+            (TABLE, LEGACY_TABLE),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _columns(self, table: str = TABLE) -> set[str]:
+        return {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
 
     # ── directory keys ───────────────────────────────────────────────────
 
@@ -140,29 +164,29 @@ class Catalog:
             return {r[0] for r in cur}
 
     def pending(self, key: str) -> dict[str, tuple[str, str]]:
-        """{original_name: (proposed_name, summary)} awaiting confirmation."""
+        """{original_name: (filename, summary)} awaiting confirmation."""
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT original_name, proposed_name, summary FROM {TABLE} "
+                f"SELECT original_name, filename, summary FROM {TABLE} "
                 "WHERE directory = ? AND status = 'pending'",
                 (key,),
             )
             return {r[0]: (r[1], r[2] or "") for r in cur}
 
     def applied_index(self) -> dict[tuple[str, str], tuple[int, str]]:
-        """{(directory_key, proposed_name): (id, applied_at)} for shelved rows."""
+        """{(directory_key, filename): (id, applied_at)} for shelved rows."""
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT id, directory, proposed_name, applied_at FROM {TABLE} "
+                f"SELECT id, directory, filename, applied_at FROM {TABLE} "
                 "WHERE status = 'applied'"
             )
             return {(r[1], r[2]): (r[0], r[3] or "") for r in cur}
 
     def missing_summaries(self) -> list[tuple[int, str]]:
-        """(id, proposed_name) for shelved rows never attempted (NULL only)."""
+        """(id, filename) for shelved rows never attempted (NULL only)."""
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT id, proposed_name FROM {TABLE} "
+                f"SELECT id, filename FROM {TABLE} "
                 "WHERE status = 'applied' AND summary IS NULL"
             )
             return [(r[0], r[1]) for r in cur]
@@ -180,7 +204,7 @@ class Catalog:
     ) -> None:
         """Upsert proposals for `key`, stamping applied_at when applied.
 
-        `db_value` reproduces the legacy `proposed_name` format, including the
+        `db_value` reproduces the stored `filename` format, including the
         "Category/Title.pdf" form used while a book sits in the landing pad.
         """
         with self._lock:
@@ -188,11 +212,11 @@ class Catalog:
                 self._conn.execute(
                     f"""
                     INSERT INTO {TABLE}
-                        (directory, original_name, proposed_name, summary, status, applied_at)
+                        (directory, original_name, filename, summary, status, applied_at)
                     VALUES (?, ?, ?, ?, ?,
                             CASE ? WHEN 'applied' THEN {NOW_SQL} ELSE NULL END)
                     ON CONFLICT(directory, original_name) DO UPDATE SET
-                        proposed_name = excluded.proposed_name,
+                        filename      = excluded.filename,
                         summary       = excluded.summary,
                         status        = excluded.status,
                         applied_at    = excluded.applied_at
@@ -222,7 +246,7 @@ class Catalog:
         with self._lock:
             self._conn.execute(
                 f"""UPDATE {TABLE}
-                    SET directory = ?, original_name = ?, proposed_name = ?,
+                    SET directory = ?, original_name = ?, filename = ?,
                         status = 'applied', applied_at = {NOW_SQL}
                     WHERE directory = ? AND original_name = ?""",
                 (dst_key, dst_name, dst_name, src_key, src_name),
@@ -265,16 +289,16 @@ class Catalog:
     def all_books(self) -> list[dict]:
         with self._lock:
             cur = self._conn.execute(
-                f"""SELECT id, directory, proposed_name, summary, accessed_at
+                f"""SELECT id, directory, filename, summary, accessed_at
                     FROM {TABLE}
                     WHERE status = 'applied' AND {NOT_HELPER_SQL}
-                    ORDER BY directory, proposed_name COLLATE NOCASE"""
+                    ORDER BY directory, filename COLLATE NOCASE"""
             )
             return [
                 {
                     "id": r["id"],
                     "category": r["directory"],
-                    "filename": r["proposed_name"],
+                    "filename": r["filename"],
                     "summary": r["summary"] or "",
                     "accessed_at": r["accessed_at"],
                 }
@@ -284,7 +308,7 @@ class Catalog:
     def recent_books(self, limit: int = 10) -> list[dict]:
         with self._lock:
             cur = self._conn.execute(
-                f"""SELECT id, directory, proposed_name, accessed_at
+                f"""SELECT id, directory, filename, accessed_at
                     FROM {TABLE}
                     WHERE status = 'applied' AND accessed_at IS NOT NULL
                       AND {NOT_HELPER_SQL}
@@ -296,7 +320,7 @@ class Catalog:
                 {
                     "id": r["id"],
                     "category": r["directory"],
-                    "filename": r["proposed_name"],
+                    "filename": r["filename"],
                     "accessed_at": r["accessed_at"],
                 }
                 for r in cur
@@ -314,7 +338,7 @@ class Catalog:
     def book_row(self, book_id: int) -> sqlite3.Row | None:
         with self._lock:
             return self._conn.execute(
-                f"""SELECT id, directory, original_name, proposed_name, summary,
+                f"""SELECT id, directory, original_name, filename, summary,
                            status, applied_at, accessed_at
                     FROM {TABLE} WHERE id = ?""",
                 (book_id,),
@@ -326,7 +350,7 @@ class Catalog:
         if not row:
             return None
         root = self.config.data_dir
-        candidate = (root / row["directory"] / row["proposed_name"]).resolve()
+        candidate = (root / row["directory"] / row["filename"]).resolve()
         # Guard against path traversal — must stay inside the shelf.
         if root not in candidate.parents and candidate != root:
             return None

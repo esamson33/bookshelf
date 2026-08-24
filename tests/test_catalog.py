@@ -43,7 +43,9 @@ class MigrationTest(CatalogTestCase):
     def test_creates_schema_from_empty(self):
         cat = self.open()
         self.assertEqual(cat.migrate(), 0)
-        self.assertEqual(cat._columns() >= {"summary", "accessed_at"}, True)
+        self.assertEqual(cat._existing_table(), "books")
+        self.assertLessEqual({"filename", "summary", "accessed_at"}, cat._columns())
+        self.assertNotIn("proposed_name", cat._columns())
         self.assertEqual(cat.applied_count(), 0)
 
     def test_stamps_version(self):
@@ -92,6 +94,63 @@ class MigrationTest(CatalogTestCase):
         cat = self.open()
         cat.migrate()
         self.assertEqual(cat.all_books()[0]["summary"], "kept")
+
+
+class V4RenameTest(CatalogTestCase):
+    """v4 renamed the table to `books` and proposed_name to `filename`."""
+
+    def seed_legacy(self, summary_column=True):
+        conn = sqlite3.connect(self.cfg.db_path)
+        conn.execute(LEGACY_DDL)
+        if summary_column:
+            conn.execute("ALTER TABLE renames ADD COLUMN summary TEXT")
+            conn.execute("ALTER TABLE renames ADD COLUMN accessed_at TEXT")
+        conn.execute(
+            "INSERT INTO renames (directory, original_name, proposed_name, status, applied_at) "
+            "VALUES ('Networking', 'raw.pdf', 'Real.pdf', 'applied', '2026-01-01 00:00:00')")
+        conn.commit()
+        conn.close()
+
+    def test_table_is_renamed_and_the_old_name_is_gone(self):
+        self.seed_legacy()
+        cat = self.open()
+        cat.migrate()
+        self.assertEqual(cat._existing_table(), "books")
+        names = {r[0] for r in cat._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertNotIn("renames", names)
+
+    def test_column_is_renamed_preserving_values(self):
+        self.seed_legacy()
+        cat = self.open()
+        cat.migrate()
+        self.assertIn("filename", cat._columns())
+        self.assertNotIn("proposed_name", cat._columns())
+        self.assertEqual(cat.all_books()[0]["filename"], "Real.pdf")
+
+    def test_rows_survive_the_rename(self):
+        self.seed_legacy()
+        cat = self.open()
+        cat.migrate()
+        self.assertEqual(cat.applied_count(), 1)
+        self.assertEqual(cat.applied_names("Networking"), {"raw.pdf"})
+
+    def test_oldest_shape_upgrades_all_the_way_in_one_pass(self):
+        """No stamp, no summary, no accessed_at, old table and column name."""
+        self.seed_legacy(summary_column=False)
+        cat = self.open()
+        self.assertEqual(cat.migrate(), 0)
+        self.assertEqual(cat._existing_table(), "books")
+        self.assertLessEqual({"filename", "summary", "accessed_at"}, cat._columns())
+        self.assertEqual(cat.applied_count(), 1)
+
+    def test_migrating_twice_is_a_no_op(self):
+        self.seed_legacy()
+        cat = self.open()
+        cat.migrate()
+        self.assertEqual(cat.migrate(), SCHEMA_VERSION)
+        self.assertEqual(cat.applied_count(), 1)
+        self.assertEqual(cat._existing_table(), "books")
 
 
 class KeyTest(CatalogTestCase):
@@ -178,7 +237,7 @@ class QueryTest(CatalogTestCase):
         # A NULL summary only arises on rows predating the column, so insert
         # one directly — Proposal always writes a string.
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, summary) "
+            "INSERT INTO books (directory, original_name, filename, status, summary) "
             "VALUES ('Networking', 'a.pdf', 'A.pdf', 'applied', NULL)")
         self.cat.commit()
         # "" means "asked, none available" — not retried.
@@ -190,7 +249,7 @@ class QueryTest(CatalogTestCase):
 
     def test_set_summaries_persists(self):
         self.cat._conn.execute(
-            "INSERT INTO renames (directory, original_name, proposed_name, status, summary) "
+            "INSERT INTO books (directory, original_name, filename, status, summary) "
             "VALUES ('Networking', 'a.pdf', 'A.pdf', 'applied', NULL)")
         self.cat.commit()
         row_id, _ = self.cat.missing_summaries()[0]
