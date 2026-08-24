@@ -68,6 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("summaries", parents=[common], help="Fetch summaries for books missing one")
     p.add_argument(*yes, action="store_true", help=argparse.SUPPRESS)
 
+    p = sub.add_parser("serve", parents=[common], help="Run the local web reader")
+    p.add_argument("--port", type=int, default=8765, help="Port (default 8765)")
+
     return parser
 
 
@@ -92,6 +95,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = Config.from_args(args)
+
+    if args.command == "serve":
+        # The reader owns its own Catalog (threaded, one per process).
+        from .server import serve
+
+        return serve(config, args.port)
+
     catalog = Catalog(config)
     catalog.migrate()
     ctx = Context(config=config, catalog=catalog, lookup=LookupClient(config))

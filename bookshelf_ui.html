@@ -459,7 +459,7 @@
       n.className = 'notice';
       const plural = UNCLASSIFIED === 1 ? 'file' : 'files';
       n.innerHTML = `<b>${UNCLASSIFIED}</b> unclassified ${plural} waiting in ` +
-                    `<code>__landing/</code>. Run <code>./rename_books.py --new</code> to file ${UNCLASSIFIED === 1 ? 'it' : 'them'}.`;
+                    `<code>__landing/</code>. Run <code>bookshelf shelve</code> to file ${UNCLASSIFIED === 1 ? 'it' : 'them'}.`;
       side.appendChild(n);
     }
 
