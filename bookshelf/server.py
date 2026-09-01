@@ -14,6 +14,7 @@ Features:
   • Search across filename + summary.
   • "Recent" section: the 10 most recently opened books.
   • Read a book's PDF in the right-hand pane.
+  • Serve the favicon set and web manifest from static/.
 
 Opening a book stamps `accessed_at`, which drives the Recent list.
 
@@ -36,6 +37,7 @@ MIME_OVERRIDES = {
     ".mjs": "text/javascript", ".js": "text/javascript", ".css": "text/css",
     ".html": "text/html; charset=utf-8", ".json": "application/json",
     ".map": "application/json", ".wasm": "application/wasm",
+    ".webmanifest": "application/manifest+json",
     ".bcmap": "application/octet-stream", ".pfb": "application/octet-stream",
     ".ftl": "text/plain; charset=utf-8", ".properties": "text/plain; charset=utf-8",
     ".svg": "image/svg+xml", ".png": "image/png", ".gif": "image/gif",
@@ -48,14 +50,19 @@ MIME_OVERRIDES = {
 CATALOG: Catalog = None  # type: ignore
 
 
-# The UI file and vendor/ live in the app directory, not beside this module,
-# so they are resolved from the config rather than from __file__.
+# The UI file, vendor/ and static/ live in the app directory, not beside this
+# module, so they are resolved from the config rather than from __file__.
 def ui_file() -> Path:
     return CATALOG.config.app_dir / "bookshelf_ui.html"
 
 
 def vendor_dir() -> Path:
     return (CATALOG.config.app_dir / "vendor").resolve()
+
+
+def static_dir() -> Path:
+    """The favicon set and web manifest — same app-dir rule as vendor/."""
+    return (CATALOG.config.app_dir / "static").resolve()
 
 
 # ── data access ──────────────────────────────────────────────────────────────
@@ -141,7 +148,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/pdf/"):
             return self._serve_pdf(path[len("/pdf/"):])
         if path.startswith("/vendor/"):
-            return self._serve_vendor(path[len("/vendor/"):])
+            return self._serve_static(vendor_dir(), path[len("/vendor/"):])
+        if path.startswith("/static/"):
+            return self._serve_static(static_dir(), path[len("/static/"):])
+        # Browsers ask for /favicon.ico on their own, ignoring the <link> tags.
+        if path == "/favicon.ico":
+            return self._serve_static(static_dir(), "favicon.ico")
         return self._not_found()
 
     def do_HEAD(self):
@@ -167,11 +179,10 @@ class Handler(BaseHTTPRequestHandler):
             )
         self._send_bytes(data, "text/html; charset=utf-8")
 
-    def _serve_vendor(self, rel_url: str):
-        """Serve static files from the vendor/ folder (the PDF.js viewer)."""
-        base   = vendor_dir()
+    def _serve_static(self, base: Path, rel_url: str):
+        """Serve a file from a static root (vendor/ or static/)."""
         target = (base / unquote(rel_url)).resolve()
-        # Path-traversal guard: must stay inside vendor/.
+        # Path-traversal guard: must stay inside the given root.
         if base not in target.parents or not target.is_file():
             return self._not_found()
         ext   = target.suffix.lower()

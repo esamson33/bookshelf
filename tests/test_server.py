@@ -1,8 +1,8 @@
 """The web reader, driven over a real socket on an ephemeral port.
 
-The move into the package broke the old SCRIPT_DIR assumption — the UI file
-and vendor/ live in the app directory, not beside the module — so those paths
-are what these tests pin down.
+The move into the package broke the old SCRIPT_DIR assumption — the UI file,
+vendor/ and static/ live in the app directory, not beside the module — so those
+paths are what these tests pin down.
 """
 
 import json
@@ -28,9 +28,13 @@ class ServerTestCase(unittest.TestCase):
         self.data = self.app / "data"
         (self.data / "Networking").mkdir(parents=True)
         (self.app / "vendor" / "pdfjs").mkdir(parents=True)
+        (self.app / "static").mkdir()
 
         (self.app / "bookshelf_ui.html").write_text("<h1>UI</h1>")
         (self.app / "vendor" / "pdfjs" / "pdf.mjs").write_text("export const x = 1;")
+        (self.app / "static" / "favicon.ico").write_bytes(b"\x00\x00\x01\x00")
+        (self.app / "static" / "favicon-32.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        (self.app / "static" / "site.webmanifest").write_text('{"name": "Bookshelf"}')
         (self.app / "secret.txt").write_text("do not serve me")
         self.pdf = self.data / "Networking" / "Real.pdf"
         self.pdf.write_bytes(b"%PDF-1.4 " + b"x" * 500)
@@ -99,6 +103,33 @@ class PathResolutionTest(ServerTestCase):
 
     def test_vendor_traversal_is_blocked(self):
         self.assertEqual(self.status_of("/vendor/../secret.txt"), 404)
+
+    def test_static_dir_comes_from_the_app_dir(self):
+        self.assertEqual(server.static_dir(), self.app / "static")
+
+    def test_static_traversal_is_blocked(self):
+        self.assertEqual(self.status_of("/static/../secret.txt"), 404)
+
+
+class FaviconTest(ServerTestCase):
+    def test_bare_favicon_ico_is_served(self):
+        """Browsers request /favicon.ico themselves, ignoring the <link> tags."""
+        status, body, headers = self.get("/favicon.ico")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, (self.app / "static" / "favicon.ico").read_bytes())
+        self.assertEqual(headers["Content-Type"], "image/x-icon")
+
+    def test_png_icon_is_served_with_the_png_type(self):
+        status, _, headers = self.get("/static/favicon-32.png")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/png")
+
+    def test_manifest_is_served_with_the_manifest_type(self):
+        _, _, headers = self.get("/static/site.webmanifest")
+        self.assertEqual(headers["Content-Type"], "application/manifest+json")
+
+    def test_missing_static_file_is_404(self):
+        self.assertEqual(self.status_of("/static/nope.png"), 404)
 
 
 class ApiTest(ServerTestCase):
