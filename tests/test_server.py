@@ -183,6 +183,23 @@ class ApiTest(ServerTestCase):
     def test_open_on_an_unknown_id_is_404(self):
         self.assertEqual(self.status_of("/api/open/999999", method="POST"), 404)
 
+    def test_forget_clears_accessed_at_and_returns_recent(self):
+        book_id = self.book_id()
+        self.catalog.mark_opened(book_id)
+        _, body, _ = self.get("/api/recent")
+        self.assertEqual(len(json.loads(body)["recent"]), 1)
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/forget/{book_id}", method="POST")
+        with urllib.request.urlopen(request) as response:
+            payload = json.loads(response.read())
+        self.assertEqual(payload["recent"], [])
+        self.assertIsNone(self.catalog.book_row(book_id)["accessed_at"])
+
+    def test_forget_on_an_unknown_id_is_404(self):
+        self.assertEqual(self.status_of("/api/forget/999999", method="POST"), 404)
+        self.assertEqual(self.status_of("/api/forget/abc", method="POST"), 404)
+
 
 class PdfTest(ServerTestCase):
     def test_full_pdf_is_served(self):

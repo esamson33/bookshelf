@@ -335,6 +335,16 @@ class Catalog:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def clear_accessed(self, book_id: int) -> bool:
+        """Drop a book off the Recent list by clearing its access stamp."""
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE {TABLE} SET accessed_at = NULL WHERE id = ?",
+                (book_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def book_row(self, book_id: int) -> sqlite3.Row | None:
         with self._lock:
             return self._conn.execute(

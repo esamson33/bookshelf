@@ -20,6 +20,7 @@
     --muted: #6b7382;
     --accent: #3b6ef5;
     --accent-soft: #e7efff;
+    --danger: #d4383d;
     --shadow: 0 1px 3px rgba(20,25,40,.08);
   }
   @media (prefers-color-scheme: dark) {
@@ -32,6 +33,7 @@
       --muted: #8a93a3;
       --accent: #5b8bff;
       --accent-soft: #1d2a45;
+      --danger: #f0666b;
       --shadow: 0 1px 3px rgba(0,0,0,.4);
     }
   }
@@ -127,18 +129,28 @@
 
   .empty { color: var(--muted); padding: 10px 16px; font-size: 13px; }
 
-  /* an info affordance per book — revealed on hover/focus so the list stays calm */
+  /* per-book affordances — revealed on hover/focus so the list stays calm.
+     Info on top; below it, on Recent rows only, an × that forgets the book.
+     They stack in a column rather than at fixed offsets, and the row carries a
+     min-height so the pair never runs past the bottom edge of a short row. */
   .book-row { position: relative; }
   .book-row .book { padding-right: 34px; }
-  .info-btn {
-    position: absolute; top: 5px; right: 6px; width: 22px; height: 22px;
+  .book-row.has-forget .book { min-height: 47px; }
+  .row-btns {
+    position: absolute; top: 5px; right: 6px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .row-btn {
+    width: 18px; height: 18px;
     display: flex; align-items: center; justify-content: center;
     border: none; background: none; border-radius: 50%; cursor: pointer;
-    color: var(--muted); font-size: 13px; line-height: 1;
+    color: var(--muted); font-size: 13px; line-height: 1; padding: 0;
     opacity: 0; transition: opacity .12s;
   }
-  .book-row:hover .info-btn, .info-btn:focus-visible { opacity: 1; }
+  .forget-btn { font-size: 14px; }
+  .book-row:hover .row-btn, .row-btn:focus-visible { opacity: 1; }
   .info-btn:hover { background: var(--border); color: var(--accent); }
+  .forget-btn:hover { background: var(--border); color: var(--danger); }
 
   /* ── book info modal: cover on the top 2/3, details on the bottom 1/3 ──── */
   .backdrop {
@@ -294,6 +306,18 @@
       .catch(() => {});
   }
 
+  // Drop a book off the Recent list — clears its access stamp, nothing else.
+  function forget(book) {
+    fetch(`/api/forget/${book.id}`, { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        if (!data.recent) return;
+        RECENT = data.recent;
+        if (!$('#q').value.trim()) render();
+      })
+      .catch(() => {});
+  }
+
   // Reopen the last book read (restores view only; no access stamp).
   function restoreLast() {
     const id = parseInt(store.get(KEY_LAST), 10);
@@ -304,9 +328,9 @@
 
   const stemOf = book => book.filename.replace(/\.pdf$/i, '');
 
-  // A row = the book button plus an info affordance overlaid at its right edge
+  // A row = the book button plus the affordances overlaid at its right edge
   // (a button can't nest inside a button, hence the wrapper).
-  function bookButton(book, {showCat = false} = {}) {
+  function bookButton(book, {showCat = false, showForget = false} = {}) {
     const row = document.createElement('div');
     row.className = 'book-row';
 
@@ -320,16 +344,32 @@
     b.innerHTML = html;
     b.addEventListener('click', () => open(book));
 
+    const btns = document.createElement('div');
+    btns.className = 'row-btns';
+
     const info = document.createElement('button');
-    info.className = 'info-btn';
+    info.className = 'row-btn info-btn';
     info.type = 'button';
     info.textContent = '\u24d8';
     info.title = 'Book info';
     info.setAttribute('aria-label', `Info about ${stem}`);
     info.addEventListener('click', e => { e.stopPropagation(); showInfo(book); });
+    btns.appendChild(info);
+
+    if (showForget) {
+      row.classList.add('has-forget');
+      const x = document.createElement('button');
+      x.className = 'row-btn forget-btn';
+      x.type = 'button';
+      x.textContent = '\u00d7';
+      x.title = 'Remove from Recent';
+      x.setAttribute('aria-label', `Remove ${stem} from Recent`);
+      x.addEventListener('click', e => { e.stopPropagation(); forget(book); });
+      btns.appendChild(x);
+    }
 
     row.appendChild(b);
-    row.appendChild(info);
+    row.appendChild(btns);
     return row;
   }
 
@@ -492,7 +532,8 @@
       side.appendChild(t);
       RECENT.forEach(rb => {
         const full = BOOKS.find(b => b.id === rb.id) || rb;
-        side.appendChild(bookButton({...full, summary: full.summary || ''}, {showCat: true}));
+        side.appendChild(bookButton({...full, summary: full.summary || ''},
+                                    {showCat: true, showForget: true}));
       });
     }
 

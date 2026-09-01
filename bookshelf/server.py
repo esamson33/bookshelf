@@ -12,11 +12,12 @@ Standard library only — no pip installs.
 Features:
   • Browse books grouped by category (the catalog `directory` column).
   • Search across filename + summary.
-  • "Recent" section: the 10 most recently opened books.
+  • "Recent" section: the 10 most recently opened books, each removable.
   • Read a book's PDF in the right-hand pane.
   • Serve the favicon set and web manifest from static/.
 
-Opening a book stamps `accessed_at`, which drives the Recent list.
+Opening a book stamps `accessed_at`, which drives the Recent list; removing a
+book from Recent clears that stamp again.
 
 All SQL and schema handling lives in bookshelf.catalog.Catalog, which this
 module shares with the CLI.
@@ -161,11 +162,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
-        if path.startswith("/api/open/"):
-            raw = path[len("/api/open/"):]
-            if raw.isdigit() and CATALOG.mark_opened(int(raw)):
-                return self._send_json({"recent": CATALOG.recent_books()})
-            return self._send_json({"error": "unknown book"}, status=404)
+        # Both endpoints edit `accessed_at` and answer with the fresh Recent list.
+        for prefix, action in (("/api/open/", CATALOG.mark_opened),
+                               ("/api/forget/", CATALOG.clear_accessed)):
+            if path.startswith(prefix):
+                raw = path[len(prefix):]
+                if raw.isdigit() and action(int(raw)):
+                    return self._send_json({"recent": CATALOG.recent_books()})
+                return self._send_json({"error": "unknown book"}, status=404)
         return self._not_found()
 
     # -- endpoints --
