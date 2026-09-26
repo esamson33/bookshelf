@@ -10,8 +10,6 @@ from .base import Context, Outcome, Plan
 
 class SummaryPlan(Plan):
     empty_message = "All summaries already filled."
-    #: Nothing to preview or confirm — it only reads and fills in blanks.
-    confirm_required = False
 
     def __init__(self, missing: list[tuple[int, str]], ctx: Context):
         self.missing = missing
@@ -19,6 +17,10 @@ class SummaryPlan(Plan):
 
     def is_empty(self) -> bool:
         return not self.missing
+
+    def payload(self) -> dict:
+        """There is nothing to review — only a count worth showing first."""
+        return {"missing": len(self.missing)}
 
     def apply(self, catalog: Catalog) -> Outcome:
         self.ctx.out(f"Fetching summaries for {len(self.missing)} book(s)…\n")

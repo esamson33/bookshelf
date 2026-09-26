@@ -119,23 +119,53 @@ class RenamePlanTest(PlanTestCase):
         self.assertEqual((outcome.ok, outcome.errors), (0, 1))
         self.assertTrue((directory / "raw.pdf").is_file())
 
-    def test_directory_headings_appear_only_when_recursive_finds_several(self):
-        one = rename_plan.RenamePlan([(self.data / "A", [Proposal("a.pdf", "A.pdf")])],
-                                     self.data)
-        self.assertEqual(one.preview().sections[0].heading, "")
-
-        two = rename_plan.RenamePlan(
-            [(self.data / "A", [Proposal("a.pdf", "A.pdf")]),
-             (self.data / "B", [Proposal("b.pdf", "B.pdf")])], self.data)
-        self.assertEqual(two.preview().sections[0].heading, "\nA/")
-
-    def test_row_numbers_continue_across_directories(self):
+    def test_payload_labels_each_group_relative_to_the_scanned_root(self):
         plan = rename_plan.RenamePlan(
             [(self.data / "A", [Proposal("a.pdf", "A.pdf")]),
              (self.data / "B", [Proposal("b.pdf", "B.pdf")])], self.data)
-        sections = plan.preview().sections
-        self.assertEqual(sections[0].rows[0][0], 1)
-        self.assertEqual(sections[1].rows[0][0], 2)
+        groups = plan.payload()["groups"]
+        self.assertEqual([g["directory"] for g in groups], ["A", "B"])
+        self.assertEqual(groups[0]["rows"][0]["original"], "a.pdf")
+        self.assertEqual(groups[0]["rows"][0]["proposed"], "A.pdf")
+
+    def test_payload_falls_back_to_an_absolute_path_outside_the_root(self):
+        outside = Path(self.tmp.name).resolve() / "elsewhere"
+        plan = rename_plan.RenamePlan([(outside, [Proposal("a.pdf", "A.pdf")])],
+                                      self.data)
+        self.assertEqual(plan.payload()["groups"][0]["directory"], str(outside))
+
+    def test_from_pending_rebuilds_staged_proposals_with_their_row_ids(self):
+        directory = self.data / "Networking"
+        directory.mkdir(parents=True, exist_ok=True)
+        self.cat.stage(self.cat.key(directory), [Proposal("raw.pdf", "Real.pdf", "s")])
+
+        plan = rename_plan.from_pending(self.context(), directory)
+
+        row = plan.payload()["groups"][0]["rows"][0]
+        self.assertEqual(row["proposed"], "Real.pdf")
+        self.assertEqual(row["summary"], "s")
+        self.assertIsNotNone(row["id"])
+
+    def test_from_pending_sweeps_in_subdirectories(self):
+        """A recursive scan stages a row under every directory it walked."""
+        for name in ("Networking", "Networking/Deep"):
+            (self.data / name).mkdir(parents=True, exist_ok=True)
+            self.cat.stage(self.cat.key(self.data / name),
+                           [Proposal("raw.pdf", f"{Path(name).name}.pdf")])
+
+        plan = rename_plan.from_pending(self.context(), self.data / "Networking")
+
+        self.assertEqual([g["directory"] for g in plan.payload()["groups"]],
+                         [".", "Deep"])
+
+    def test_from_pending_leaves_the_landing_pad_to_shelve(self):
+        self.cfg.landing_dir.mkdir(parents=True, exist_ok=True)
+        self.cat.stage(self.cat.key(self.cfg.landing_dir),
+                       [Proposal("raw.pdf", "Cat/Real.pdf")])
+
+        plan = rename_plan.from_pending(self.context(), self.data)
+
+        self.assertTrue(plan.is_empty())
 
 
 class ShelvePlanTest(PlanTestCase):
@@ -191,23 +221,42 @@ class ShelvePlanTest(PlanTestCase):
         self.assertEqual(plan.proposals[0].filename, "Fresh.pdf")
         self.assertIn("Cleared 1 previously proposed move(s); starting fresh.", self.printed)
 
-    def test_edit_retargets_a_row_without_mutating_the_old_proposal(self):
-        plan = shelve_plan.ShelvePlan([Proposal("raw.pdf", "R.pdf", "", "Old")],
+    def test_payload_carries_the_category_and_title_separately(self):
+        plan = shelve_plan.ShelvePlan([Proposal("raw.pdf", "R.pdf", "why", "Old")],
                                       self.landing, self.data)
-        original = plan.proposals[0]
-        import builtins
-        saved, builtins.input = builtins.input, lambda _: "New"
-        try:
-            self.assertTrue(plan.edit(0))
-        finally:
-            builtins.input = saved
-        self.assertEqual(plan.proposals[0].category, "New")
-        self.assertEqual(original.category, "Old")
+        row = plan.payload()["rows"][0]
+        self.assertEqual(row["original"], "raw.pdf")
+        self.assertEqual(row["category"], "Old")
+        self.assertEqual(row["title"], "R")
+        self.assertEqual(row["summary"], "why")
 
-    def test_edit_rejects_an_out_of_range_row(self):
-        plan = shelve_plan.ShelvePlan([Proposal("a.pdf", "A.pdf", "", "C")],
-                                      self.landing, self.data)
-        self.assertFalse(plan.edit(5))
+    def test_from_pending_reads_back_a_staged_batch(self):
+        (self.landing / "raw.pdf").write_bytes(b"%PDF")
+        self.cat.stage(self.cat.key(self.landing),
+                       [Proposal("raw.pdf", "R.pdf", "why", "Old")])
+
+        rows = shelve_plan.from_pending(self.context()).payload()["rows"]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["category"], rows[0]["proposed"]), ("Old", "R.pdf"))
+        self.assertIsNotNone(rows[0]["id"])
+
+    def test_from_pending_drops_a_proposal_whose_file_vanished(self):
+        """Otherwise the row would only fail at apply() time."""
+        self.cat.stage(self.cat.key(self.landing),
+                       [Proposal("gone.pdf", "G.pdf", "", "Old")])
+        self.assertTrue(shelve_plan.from_pending(self.context()).is_empty())
+
+    def test_from_pending_reflects_an_edit_made_between_review_and_apply(self):
+        (self.landing / "raw.pdf").write_bytes(b"%PDF")
+        self.cat.stage(self.cat.key(self.landing),
+                       [Proposal("raw.pdf", "R.pdf", "", "Old")])
+        row_id = self.cat.pending_rows(self.cat.key(self.landing))[0]["id"]
+
+        self.cat.set_pending_value(row_id, "New/Better.pdf")
+
+        proposal = shelve_plan.from_pending(self.context()).proposals[0]
+        self.assertEqual((proposal.category, proposal.filename), ("New", "Better.pdf"))
 
     def test_apply_moves_the_file_and_rekeys_the_row(self):
         (self.landing / "raw.pdf").write_bytes(b"%PDF")
@@ -262,13 +311,21 @@ class DedupePlanTest(PlanTestCase):
         self.assertEqual(plan.duplicates[0].remove_db_ids, ())
         self.assertEqual(plan.record_count, 0)
 
-    def test_preview_marks_only_genuinely_tracked_removals(self):
+    def test_payload_marks_only_genuinely_tracked_removals(self):
         """The original labelled every removal '(+ DB record)' unconditionally."""
         self.touch("Networking/dup.pdf")
         self.touch("Systems/dup.pdf")
         plan = dedupe_plan.build(self.context())
-        lines = "\n".join(plan.preview().sections[0].lines)
-        self.assertNotIn("(+ DB record)", lines)
+        removals = plan.payload()["duplicates"][0]["remove"]
+        self.assertEqual([r["tracked"] for r in removals], [False])
+
+    def test_payload_reports_what_would_be_deleted(self):
+        self.touch("Networking/dup.pdf")
+        self.touch("Systems/dup.pdf")
+        self.cat.stage("Networking", [Proposal("gone.pdf", "gone.pdf")], status="applied")
+        payload = dedupe_plan.build(self.context()).payload()
+        self.assertEqual(payload["file_count"], 1)
+        self.assertEqual([s["path"] for s in payload["stale"]], ["Networking/gone.pdf"])
 
     def test_stale_rows_are_found(self):
         self.cat.stage("Networking", [Proposal("gone.pdf", "gone.pdf")], status="applied")
@@ -302,8 +359,12 @@ class SummaryPlanTest(PlanTestCase):
                        status="applied")
         self.assertTrue(summaries_plan.build(self.context()).is_empty())
 
-    def test_needs_no_confirmation(self):
-        self.assertFalse(summaries_plan.build(self.context()).confirm_required)
+    def test_payload_reports_only_a_count(self):
+        self.cat._conn.execute(
+            "INSERT INTO books (directory, original_name, filename, status)"
+            " VALUES ('Networking','a.pdf','A.pdf','applied')")
+        self.cat.commit()
+        self.assertEqual(summaries_plan.build(self.context()).payload(), {"missing": 1})
 
     def test_fills_in_what_the_model_returns(self):
         self.cat._conn.execute(

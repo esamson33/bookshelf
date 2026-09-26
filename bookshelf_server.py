@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-bookshelf_server.py — compatibility shim for the local web reader.
+bookshelf_server.py — launch the Bookshelf web UI.
 
-The reader now lives in the package and is reachable as a subcommand:
+    ./bookshelf_server.py [--port 9000] [--db PATH] [--root PATH]
 
-    bookshelf serve [--port 9000] [--db PATH] [--root PATH]
-
-This script forwards to it so existing invocations keep working.
+Equivalent to `python3 -m bookshelf`.
 """
 
 import sys
@@ -14,4 +12,4 @@ import sys
 from bookshelf.cli import main
 
 if __name__ == "__main__":
-    sys.exit(main(["serve", *sys.argv[1:]]))
+    sys.exit(main(sys.argv[1:]))

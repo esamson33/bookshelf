@@ -6,54 +6,38 @@ from pathlib import Path
 
 from ..catalog import Catalog
 from ..models import Proposal
-from ..render import truncate
 from ..scan import collect_pdfs, reconcile
-from .base import Context, Outcome, Plan, PlanError, Preview, Section
+from .base import Context, Outcome, Plan, PlanError
 
 
 class RenamePlan(Plan):
-    abort_message = "Aborted. Proposals are saved — re-run to apply them."
-
     def __init__(self, groups: list[tuple[Path, list[Proposal]]], root: Path,
                  empty_message: str = "No renames needed."):
         self.groups = groups
         self.root = root
         self.empty_message = empty_message
 
-    @property
-    def row_count(self) -> int:
-        return sum(len(p) for _, p in self.groups)
-
     def is_empty(self) -> bool:
         return not self.groups
 
-    def confirm_prompt(self) -> str:
-        return "Apply these renames? [y/N] "
+    def _label(self, directory: Path) -> str:
+        try:
+            return str(directory.relative_to(self.root))
+        except ValueError:
+            return str(directory)
 
-    def preview(self) -> Preview:
-        # A directory header only earns its line when more than one is shown.
-        multi = len(self.groups) > 1
-        sections = []
-        counter = 1
-        for directory, proposals in self.groups:
-            heading = ""
-            if multi:
-                try:
-                    label = directory.relative_to(self.root)
-                except ValueError:
-                    label = directory
-                heading = f"\n{label}/"
-            sections.append(Section(
-                heading=heading,
-                headers=["#", "Original", "Renamed to", "Description"],
-                rows=[
-                    (counter + i, p.original_name, p.filename, truncate(p.summary))
-                    for i, p in enumerate(proposals)
-                ],
-                detail_last=True,
-            ))
-            counter += len(proposals)
-        return Preview(sections=sections)
+    def payload(self) -> dict:
+        """Grouped by directory, because a recursive scan spans several."""
+        return {
+            "root": str(self.root),
+            "groups": [
+                {
+                    "directory": self._label(directory),
+                    "rows": [p.as_row() for p in proposals],
+                }
+                for directory, proposals in self.groups
+            ],
+        }
 
     def stage(self, catalog: Catalog) -> None:
         for directory, proposals in self.groups:
@@ -67,7 +51,7 @@ class RenamePlan(Plan):
                 src = directory / p.original_name
                 dst = directory / p.filename
                 if dst.exists():
-                    print(f"  Skipping — destination already exists: {dst.name}")
+                    self.out(f"  Skipping — destination already exists: {dst.name}")
                     errors += 1
                     continue
                 try:
@@ -75,10 +59,35 @@ class RenamePlan(Plan):
                     catalog.mark_applied(key, p.original_name)
                     ok += 1
                 except OSError as e:
-                    print(f"  Error renaming '{src.name}': {e}")
+                    self.out(f"  Error renaming '{src.name}': {e}")
                     errors += 1
         catalog.commit()
         return Outcome(ok, errors, f"Done. {ok} renamed, {errors} error(s).")
+
+
+def from_pending(ctx: Context, root: Path) -> RenamePlan:
+    """Rebuild a plan from proposals already staged under `root`.
+
+    Costs no API call: the review, and the apply that follows it, read the same
+    `pending` rows the scan wrote. Subdirectories are swept in too, because a
+    recursive scan stages a row under each directory it walked.
+    """
+    landing = ctx.config.landing_dir
+    groups: list[tuple[Path, list[Proposal]]] = []
+    for entry in ctx.catalog.pending_by_directory():
+        directory = ctx.catalog.path(entry["directory"])
+        if directory != root and root not in directory.parents:
+            continue
+        if directory == landing or landing in directory.parents:
+            continue                      # the landing pad belongs to shelve
+        proposals = [
+            Proposal.from_db(r["original_name"], r["filename"], r["summary"],
+                             row_id=r["id"])
+            for r in ctx.catalog.pending_rows(entry["directory"])
+        ]
+        if proposals:
+            groups.append((directory, proposals))
+    return RenamePlan(groups, root)
 
 
 def build(ctx: Context, root: Path, recursive: bool, publisher: str) -> RenamePlan:
@@ -109,7 +118,7 @@ def build(ctx: Context, root: Path, recursive: bool, publisher: str) -> RenamePl
     if total_new:
         if total_skipped:
             ctx.out(f"Skipping {total_skipped} already-applied file(s).")
-        ctx.out(f"Looking up titles for {total_new} new file(s)…\n")
+        ctx.out(f"Looking up titles for {total_new} new file(s)…")
 
         stems = [Path(f).stem for _, files in new_groups for f in files]
         results = ctx.lookup.titles(stems, publisher)

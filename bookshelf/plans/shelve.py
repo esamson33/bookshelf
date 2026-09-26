@@ -6,15 +6,11 @@ from pathlib import Path
 
 from ..catalog import Catalog
 from ..models import Proposal
-from ..render import truncate
 from ..scan import categories, pdf_names, reconcile, sample_titles
-from .base import Context, Outcome, Plan, PlanError, Preview, Section
+from .base import Context, Outcome, Plan, PlanError
 
 
 class ShelvePlan(Plan):
-    abort_message = "Aborted. Proposals are saved — re-run to apply them."
-    supports_edit = True
-
     def __init__(self, proposals: list[Proposal], landing_dir: Path, data_dir: Path,
                  empty_message: str = "Nothing to shelve."):
         self.proposals = proposals
@@ -22,38 +18,11 @@ class ShelvePlan(Plan):
         self.data_dir = data_dir
         self.empty_message = empty_message
 
-    @property
-    def row_count(self) -> int:
-        return len(self.proposals)
-
     def is_empty(self) -> bool:
         return not self.proposals
 
-    def confirm_prompt(self) -> str:
-        return "Apply these moves? [y/N] or enter a row number to edit its category: "
-
-    def preview(self) -> Preview:
-        return Preview(sections=[Section(
-            headers=["#", "Original", "Category", "Renamed to", "Description"],
-            rows=[
-                (i + 1, p.original_name, p.category, p.filename, truncate(p.summary))
-                for i, p in enumerate(self.proposals)
-            ],
-            detail_last=True,
-        )])
-
-    def edit(self, index: int) -> bool:
-        """Retarget one book's category, then let the driver re-show the table."""
-        if not 0 <= index < len(self.proposals):
-            return False
-        p = self.proposals[index]
-        print(f"  Book     : {p.filename}")
-        print(f"  Category : {p.category}")
-        new_category = input("  New category: ").strip()
-        if new_category:
-            # Proposal is frozen — replace the entry so db_value stays in step.
-            self.proposals[index] = p.with_category(new_category)
-        return True
+    def payload(self) -> dict:
+        return {"rows": [p.as_row() for p in self.proposals]}
 
     def stage(self, catalog: Catalog) -> None:
         catalog.stage(catalog.key(self.landing_dir), self.proposals, status="pending")
@@ -68,7 +37,7 @@ class ShelvePlan(Plan):
             dst_dir.mkdir(exist_ok=True)
 
             if dst.exists():
-                print(f"  Skipping — destination already exists: {p.db_value}")
+                self.out(f"  Skipping — destination already exists: {p.db_value}")
                 errors += 1
                 continue
             try:
@@ -78,10 +47,28 @@ class ShelvePlan(Plan):
                 catalog.rekey(key, p.original_name, catalog.key(dst_dir), dst.name)
                 ok += 1
             except OSError as e:
-                print(f"  Error moving '{src.name}': {e}")
+                self.out(f"  Error moving '{src.name}': {e}")
                 errors += 1
         catalog.commit()
         return Outcome(ok, errors, f"Done. {ok} moved, {errors} error(s).")
+
+
+def from_pending(ctx: Context) -> ShelvePlan:
+    """Rebuild a plan from the proposals already staged for the landing pad.
+
+    Costs no API call. This is what the review screen reads and what apply
+    re-reads, so an edit made between the two is picked up.
+    """
+    landing = ctx.config.landing_dir
+    waiting = set(pdf_names(landing))
+    proposals = [
+        Proposal.from_db(r["original_name"], r["filename"], r["summary"], row_id=r["id"])
+        for r in ctx.catalog.pending_rows(ctx.catalog.key(landing))
+        # A proposal whose file was removed from __landing/ behind our back
+        # would fail at apply(); drop it from the review instead.
+        if r["original_name"] in waiting
+    ]
+    return ShelvePlan(proposals, landing, ctx.config.data_dir)
 
 
 def build(ctx: Context, category: str, fresh: bool, publisher: str) -> ShelvePlan:
@@ -104,7 +91,7 @@ def build(ctx: Context, category: str, fresh: bool, publisher: str) -> ShelvePla
 
     found = reconcile(ctx.catalog, landing, all_pdfs)
 
-    # A forced --category overrides whatever a pending proposal stored, so the
+    # A forced category overrides whatever a pending proposal stored, so the
     # whole batch is filed consistently.
     pending = [p.with_category(forced) if forced else p for p in found.pending]
     proposals: list[Proposal] = list(pending)
@@ -118,10 +105,10 @@ def build(ctx: Context, category: str, fresh: bool, publisher: str) -> ShelvePla
 
         if forced:
             ctx.out(f"Looking up titles for {len(found.unknown)} new file(s); "
-                    f"filing all into '{forced}'…\n")
+                    f"filing all into '{forced}'…")
             results = ctx.lookup.titles(found.stems, publisher)
         else:
-            ctx.out(f"Looking up titles and categories for {len(found.unknown)} new file(s)…\n")
+            ctx.out(f"Looking up titles and categories for {len(found.unknown)} new file(s)…")
             results = ctx.lookup.categorized_titles(
                 found.stems, existing, sample_titles(data_dir, existing))
 

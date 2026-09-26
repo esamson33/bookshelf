@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .config import Config
+from .config import ARCHIVE_NAME, Config
 from .models import Proposal
 
 SCHEMA_VERSION = 4
@@ -32,9 +32,13 @@ TABLE = "books"
 #: Pre-v4 name. A catalog is a list of books; only some rows describe a rename.
 LEGACY_TABLE = "renames"
 
-#: Helper directories (e.g. __landing) are staging areas, not categories.
-#: Expressed in SQL so the filter runs before ORDER BY / LIMIT.
+#: Helper directories (__landing, __archive) are staging areas, not
+#: categories. Expressed in SQL so the filter runs before ORDER BY / LIMIT.
 NOT_HELPER_SQL = "substr(directory, 1, 1) NOT IN ('_', '.')"
+
+#: Prefix of every archived row's directory key. Matched with substr() rather
+#: than LIKE, whose `_` wildcard would make "__archive/%" match far too much.
+ARCHIVE_PREFIX = ARCHIVE_NAME + "/"
 
 
 def is_helper_dir(directory: str) -> bool:
@@ -173,21 +177,61 @@ class Catalog:
             )
             return {r[0]: (r[1], r[2] or "") for r in cur}
 
+    def pending_rows(self, key: str) -> list[dict]:
+        """Pending proposals for `key`, each with the row id the UI edits by.
+
+        pending() answers the scan path, which matches on original_name and
+        has no use for the id. The web UI edits and drops individual rows, so
+        it needs one.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT id, original_name, filename, summary FROM {TABLE} "
+                "WHERE directory = ? AND status = 'pending' "
+                "ORDER BY original_name COLLATE NOCASE",
+                (key,),
+            )
+            return [
+                {"id": r[0], "original_name": r[1],
+                 "filename": r[2], "summary": r[3] or ""}
+                for r in cur
+            ]
+
+    def pending_by_directory(self) -> list[dict]:
+        """{directory, count} for every directory holding staged work.
+
+        A scan can be reviewed later, so the UI has to be able to find the
+        directories with proposals still waiting.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT directory, COUNT(*) FROM {TABLE} WHERE status = 'pending' "
+                "GROUP BY directory ORDER BY directory"
+            )
+            return [{"directory": r[0], "count": r[1]} for r in cur]
+
     def applied_index(self) -> dict[tuple[str, str], tuple[int, str]]:
-        """{(directory_key, filename): (id, applied_at)} for shelved rows."""
+        """{(directory_key, filename): (id, applied_at)} for shelved rows.
+
+        Archived rows are left out: the dedupe walk never enters __archive/,
+        so including them would report every archived book as stale.
+        """
         with self._lock:
             cur = self._conn.execute(
                 f"SELECT id, directory, filename, applied_at FROM {TABLE} "
-                "WHERE status = 'applied'"
+                f"WHERE status = 'applied' AND {NOT_HELPER_SQL}"
             )
             return {(r[1], r[2]): (r[0], r[3] or "") for r in cur}
 
     def missing_summaries(self) -> list[tuple[int, str]]:
-        """(id, filename) for shelved rows never attempted (NULL only)."""
+        """(id, filename) for shelved rows never attempted (NULL only).
+
+        An archived book is out of the library, so it is not worth a lookup.
+        """
         with self._lock:
             cur = self._conn.execute(
                 f"SELECT id, filename FROM {TABLE} "
-                "WHERE status = 'applied' AND summary IS NULL"
+                f"WHERE status = 'applied' AND summary IS NULL AND {NOT_HELPER_SQL}"
             )
             return [(r[0], r[1]) for r in cur]
 
@@ -259,6 +303,21 @@ class Catalog:
                 f"UPDATE {TABLE} SET summary = ? WHERE id = ?", updates
             )
             self._conn.commit()
+
+    def set_pending_value(self, row_id: int, db_value: str) -> bool:
+        """Retarget one staged proposal. `db_value` is Proposal.db_value, so
+        the overloaded "Category/Title.pdf" form is produced in one place.
+
+        Applied rows are deliberately out of reach: renaming a shelved book is
+        a different operation from editing a proposal.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE {TABLE} SET filename = ? WHERE id = ? AND status = 'pending'",
+                (db_value, row_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def clear_pending(self, key: str) -> int:
         with self._lock:
@@ -365,3 +424,55 @@ class Catalog:
         if root not in candidate.parents and candidate != root:
             return None
         return candidate if candidate.is_file() else None
+
+    # ── archive ──────────────────────────────────────────────────────────
+    #
+    # An archived book is an ordinary applied row whose directory key starts
+    # with "__archive/": the helper-dir filter already keeps it out of the
+    # library, Recent and search, and the category it came from is the rest
+    # of the key. No new status or column, and nothing else has to know.
+
+    def archived_books(self) -> list[dict]:
+        """Every archived book, with the category it was archived from."""
+        with self._lock:
+            cur = self._conn.execute(
+                f"""SELECT id, directory, filename, summary
+                    FROM {TABLE}
+                    WHERE status = 'applied'
+                      AND substr(directory, 1, length(?)) = ?
+                    ORDER BY directory, filename COLLATE NOCASE""",
+                (ARCHIVE_PREFIX, ARCHIVE_PREFIX),
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "category": r["directory"][len(ARCHIVE_PREFIX):],
+                    "filename": r["filename"],
+                    "summary": r["summary"] or "",
+                }
+                for r in cur
+            ]
+
+    def move_book(self, book_id: int, dst_key: str, dst_name: str) -> bool:
+        """Re-point a shelved book at its new directory and filename.
+
+        The caller has already moved the file; this only records where it
+        went. original_name and applied_at are kept, so "filed from" and the
+        dedupe tie-break both survive a round trip through the archive.
+        Raises ValueError if the destination already holds a row with that
+        original name.
+        """
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    f"""UPDATE {TABLE}
+                        SET directory = ?, filename = ?
+                        WHERE id = ? AND status = 'applied'""",
+                    (dst_key, dst_name, book_id),
+                )
+            except sqlite3.IntegrityError:
+                raise ValueError(
+                    f"The catalog already has a row for that book under {dst_key}/."
+                ) from None
+            self._conn.commit()
+            return cur.rowcount > 0

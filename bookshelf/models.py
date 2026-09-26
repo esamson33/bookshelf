@@ -33,6 +33,10 @@ class Proposal:
     filename: str
     summary: str = ""
     category: str | None = None
+    #: The catalog row this was read back from, when it was. A proposal that
+    #: has only just been looked up has no row yet; the web UI edits and drops
+    #: proposals by id, so one rebuilt from the DB carries it.
+    row_id: int | None = None
 
     def __post_init__(self):
         # summary is always a string: "" means "looked up, none available".
@@ -78,7 +82,8 @@ class Proposal:
 
     @classmethod
     def from_db(
-        cls, original_name: str, stored_name: str, summary: str = ""
+        cls, original_name: str, stored_name: str, summary: str = "",
+        row_id: int | None = None,
     ) -> "Proposal":
         """Rebuild from a stored row, splitting off a category if present.
 
@@ -93,7 +98,23 @@ class Proposal:
             filename=filename,
             summary=summary or "",
             category=category,
+            row_id=row_id,
         )
+
+    def with_title(self, title: str) -> "Proposal":
+        """Retarget the destination name, keeping the extension convention."""
+        return replace(self, filename=f"{title}{PDF_SUFFIX}")
+
+    def as_row(self) -> dict:
+        """The JSON shape the web UI renders and edits."""
+        return {
+            "id": self.row_id,
+            "original": self.original_name,
+            "title": self.title,
+            "proposed": self.filename,
+            "category": self.category,
+            "summary": self.summary,
+        }
 
 
 @dataclass(frozen=True)

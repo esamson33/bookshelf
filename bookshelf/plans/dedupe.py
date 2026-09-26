@@ -8,7 +8,7 @@ from pathlib import Path
 from ..catalog import Catalog
 from ..models import Duplicate, StaleRow
 from ..scan import is_pdf
-from .base import Context, Outcome, Plan, Preview, Section
+from .base import Context, Outcome, Plan
 
 #: Sorts after any real timestamp, so untracked copies are never the one kept.
 NEVER_APPLIED = "9999-99-99"
@@ -41,29 +41,43 @@ class DedupePlan(Plan):
         except ValueError:
             return str(path)
 
-    def preview(self) -> Preview:
-        sections = []
-        if self.duplicates:
-            lines = []
-            for d in self.duplicates:
-                lines.append(f"  {d.filename}")
-                lines.append(f"    KEEP   {self._rel(d.keep)}")
-                for path in d.remove:
-                    note = "  (+ DB record)" if (str(path.parent), d.filename) in self.tracked else ""
-                    lines.append(f"    REMOVE {self._rel(path)}{note}")
-            sections.append(Section(
-                heading=f"Filesystem duplicates ({self.file_count} file(s) to remove):\n",
-                lines=lines + [""],
-            ))
-        if self.stale:
-            sections.append(Section(
-                heading=f"Stale DB records ({len(self.stale)} row(s) with no file on disk):\n",
-                lines=[f"  {self._rel(s.path)}" for s in self.stale] + [""],
-            ))
-        return Preview(
-            sections=sections,
-            footer=f"Will delete {self.file_count} file(s) and {self.record_count} DB record(s).",
-        )
+    def payload(self) -> dict:
+        return {
+            "duplicates": [
+                {
+                    "filename": d.filename,
+                    "keep": self._rel(d.keep),
+                    "remove": [
+                        {
+                            "path": self._rel(path),
+                            # A duplicate can sit on disk with no catalog row
+                            # at all; only the tracked ones cost a DB delete.
+                            "tracked": (str(path.parent), d.filename) in self.tracked,
+                        }
+                        for path in d.remove
+                    ],
+                }
+                for d in self.duplicates
+            ],
+            "stale": [
+                {"id": s.row_id, "path": self._rel(s.path)} for s in self.stale
+            ],
+            "file_count": self.file_count,
+            "record_count": self.record_count,
+        }
+
+    def select(self, filenames=None, include_stale: bool = True) -> "DedupePlan":
+        """A copy narrowed to what the user actually ticked.
+
+        The CLI's prompt was all-or-nothing; a page can offer each duplicate
+        group and the stale rows separately, so apply must be able to act on a
+        subset without rebuilding the scan.
+        """
+        chosen = self.duplicates if filenames is None else [
+            d for d in self.duplicates if d.filename in set(filenames)
+        ]
+        return DedupePlan(chosen, self.stale if include_stale else [],
+                          self.root, self.tracked)
 
     def apply(self, catalog: Catalog) -> Outcome:
         deleted = errors = 0
@@ -73,7 +87,7 @@ class DedupePlan(Plan):
                     path.unlink()
                     deleted += 1
                 except OSError as e:
-                    print(f"  Error deleting '{path}': {e}")
+                    self.out(f"  Error deleting '{path}': {e}")
                     errors += 1
             catalog.delete_ids(d.remove_db_ids)
         catalog.delete_ids(s.row_id for s in self.stale)

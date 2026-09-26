@@ -301,8 +301,80 @@ class ReaderTest(CatalogTestCase):
         escape.write_bytes(b"%PDF")
         self.cat.stage("../", [Proposal("secret.pdf", "secret.pdf")],
                        status="applied")
-        row_id = self.cat.applied_index()[("../", "secret.pdf")][0]
+        # applied_index() skips helper-looking keys such as this one, so the
+        # id is read straight from the table.
+        row_id = self.cat._conn.execute(
+            "SELECT id FROM books WHERE original_name = 'secret.pdf'").fetchone()[0]
         self.assertIsNone(self.cat.book_path(row_id))
+
+
+class ArchiveTest(CatalogTestCase):
+    def setUp(self):
+        super().setUp()
+        self.cat = self.open()
+        self.cat.migrate()
+        self.cat.stage("Networking", [Proposal("raw.pdf", "Real.pdf", "keep me")],
+                       status="applied")
+        self.row_id = self.cat.all_books()[0]["id"]
+
+    def archive(self):
+        return self.cat.move_book(self.row_id, "__archive/Networking", "Real.pdf")
+
+    def test_an_archived_book_leaves_the_library_and_lists_in_the_archive(self):
+        self.assertTrue(self.archive())
+        self.assertEqual(self.cat.all_books(), [])
+        self.assertEqual(self.cat.archived_books(), [{
+            "id": self.row_id, "category": "Networking",
+            "filename": "Real.pdf", "summary": "keep me",
+        }])
+
+    def test_a_move_keeps_the_original_name_and_the_filing_date(self):
+        before = self.cat.book_row(self.row_id)
+        self.archive()
+        after = self.cat.book_row(self.row_id)
+        self.assertEqual(after["original_name"], "raw.pdf")
+        self.assertEqual(after["applied_at"], before["applied_at"])
+
+    def test_a_move_can_rename_on_the_way(self):
+        self.cat.move_book(self.row_id, "__archive/Networking", "Real (2).pdf")
+        self.assertEqual(self.cat.archived_books()[0]["filename"], "Real (2).pdf")
+
+    def test_archived_books_leave_the_shelf_reads_alone(self):
+        self.cat._conn.execute(
+            "INSERT INTO books (directory, original_name, filename, status, summary) "
+            "VALUES ('Systems', 'old.pdf', 'Old.pdf', 'applied', NULL)")
+        self.cat._conn.commit()
+        old_id = self.cat.all_books()[1]["id"]
+        self.cat.move_book(old_id, "__archive/Systems", "Old.pdf")
+        self.assertEqual(self.cat.missing_summaries(), [])
+        self.assertEqual(set(self.cat.applied_index()), {("Networking", "Real.pdf")})
+        self.assertEqual(self.cat.recent_books(), [])
+
+    def test_a_move_back_restores_the_book(self):
+        self.archive()
+        self.assertTrue(self.cat.move_book(self.row_id, "Networking", "Real.pdf"))
+        self.assertEqual(self.cat.archived_books(), [])
+        self.assertEqual([b["filename"] for b in self.cat.all_books()], ["Real.pdf"])
+
+    def test_a_clash_on_original_name_is_refused(self):
+        self.cat.stage("__archive/Networking", [Proposal("raw.pdf", "Other.pdf")],
+                       status="applied")
+        with self.assertRaises(ValueError):
+            self.archive()
+        # nothing changed
+        self.assertEqual(self.cat.all_books()[0]["category"], "Networking")
+
+    def test_only_applied_rows_move(self):
+        self.cat.stage("Networking", [Proposal("p.pdf", "P.pdf")])
+        pending_id = self.cat.pending_rows("Networking")[0]["id"]
+        self.assertFalse(self.cat.move_book(pending_id, "__archive/Networking", "P.pdf"))
+        self.assertFalse(self.cat.move_book(999999, "__archive/Networking", "P.pdf"))
+
+    def test_the_archive_prefix_is_matched_literally(self):
+        # "__archive/" through LIKE would read `_` as a wildcard and match this.
+        self.cat.stage("xxarchive/Networking", [Proposal("z.pdf", "Z.pdf")],
+                       status="applied")
+        self.assertEqual(self.cat.archived_books(), [])
 
 
 if __name__ == "__main__":

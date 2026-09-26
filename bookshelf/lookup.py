@@ -14,7 +14,7 @@ it, so it is deliberately untouched by this refactor.
 from __future__ import annotations
 
 import json
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
 
 from .config import Config, ConfigError
 

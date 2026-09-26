@@ -19,6 +19,9 @@ DEFAULT_MODEL = "gpt-4.1-mini"
 APP_DIR = Path(__file__).resolve().parent.parent
 
 LANDING_NAME = "__landing"
+#: Where archived books go, each under a subfolder named for the category it
+#: came from, so putting one back is a move in the other direction.
+ARCHIVE_NAME = "__archive"
 
 
 class ConfigError(Exception):
@@ -50,6 +53,10 @@ class Config:
     @property
     def landing_dir(self) -> Path:
         return self.data_dir / LANDING_NAME
+
+    @property
+    def archive_dir(self) -> Path:
+        return self.data_dir / ARCHIVE_NAME
 
     @classmethod
     def default(cls) -> "Config":

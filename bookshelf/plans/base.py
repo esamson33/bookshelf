@@ -1,15 +1,21 @@
-"""The shape every mode shares: preview, confirm, apply.
+"""The shape every mode shares: describe what would change, then change it.
 
 All four modes were the same pipeline written four times inside a 337-line
 main(), separated by sys.exit() as control flow. A Plan describes what would
-change and knows how to apply it; bookshelf.driver runs the confirmation loop
-once, for all of them.
+change and knows how to apply it.
+
+The preview used to be a terminal table and the confirmation a blocking
+input(); both now belong to the browser, so what a Plan hands back is JSON
+(`payload`) and what it writes progress through is `out`. Editing a proposal
+went with them: staged proposals live in the catalog as `pending` rows, so
+retargeting one is a row update, not a method on an object that only exists
+for the length of a request.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from dataclasses import dataclass
+from typing import Callable
 
 from ..catalog import Catalog
 from ..config import Config
@@ -17,7 +23,7 @@ from ..lookup import LookupClient
 
 
 class PlanError(Exception):
-    """A hard failure while building a plan; the CLI reports it and exits 1."""
+    """A hard failure while building a plan; the caller reports it."""
 
 
 @dataclass
@@ -31,65 +37,39 @@ class Context:
 
 
 @dataclass
-class Section:
-    """One block of a preview: a table, or free-form lines, or both."""
-
-    heading: str = ""
-    headers: Sequence[str] = ()
-    rows: Sequence[Sequence[object]] = ()
-    lines: Sequence[str] = ()
-    detail_last: bool = False
-
-
-@dataclass
-class Preview:
-    sections: list[Section] = field(default_factory=list)
-    footer: str = ""
-
-
-@dataclass
 class Outcome:
     ok: int = 0
     errors: int = 0
     summary: str = ""
 
+    def as_dict(self) -> dict:
+        return {"ok": self.ok, "errors": self.errors, "summary": self.summary}
+
 
 class Plan:
     """Base class with the defaults most plans keep.
 
-    Subclasses override preview()/apply() and, where the mode supports it,
-    edit() and stage().
+    Subclasses override payload()/apply() and, where the mode stages work for
+    later, stage().
     """
 
-    #: Shown instead of the preview when there is nothing to do.
+    #: Shown instead of the payload when there is nothing to do.
     empty_message: str = "Nothing to do."
-    #: Shown when the user declines.
-    abort_message: str = "Aborted."
-    #: False for modes that just run (summaries), skipping preview and prompt.
-    confirm_required: bool = True
-    #: True only where a row number at the prompt means something. Where it is
-    #: False the prompt is strictly y-or-abort, matching the original: any
-    #: other answer aborts rather than re-prompting.
-    supports_edit: bool = False
+
+    #: Where per-file progress and errors go. Assigned a job's `report` when
+    #: the plan runs in the background, so failures reach the page instead of
+    #: the server console.
+    out: Callable[..., None] = print
 
     def is_empty(self) -> bool:
         raise NotImplementedError
 
-    def preview(self) -> Preview:
-        return Preview()
-
-    def confirm_prompt(self) -> str:
-        return "Proceed? [y/N] "
-
-    #: Number of rows the preview shows; used for the invalid-row message.
-    row_count: int = 0
-
-    def edit(self, index: int) -> bool:
-        """Handle a row number typed at the prompt. False = not supported."""
-        return False
+    def payload(self) -> dict:
+        """What the UI renders: rows to review, plus whatever framing they need."""
+        return {}
 
     def stage(self, catalog: Catalog) -> None:
-        """Persist pending proposals so a declined run can be resumed."""
+        """Persist pending proposals so the review survives the request."""
 
     def apply(self, catalog: Catalog) -> Outcome:
         raise NotImplementedError
