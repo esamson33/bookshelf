@@ -44,6 +44,30 @@ def make_config(tmp: Path) -> Config:
 
 
 class ExtractJsonArrayTest(unittest.TestCase):
+    def test_an_array_missing_its_closing_bracket_is_salvaged(self):
+        """gpt-4.1-mini really sent this: one complete row, no final "]"."""
+        text = ('[{"original": "x", "title": "T", '
+                '"categories": [{"category": "A", "score": 100}], "summary": "s"} ')
+        rows = extract_json_array(text)
+        self.assertEqual([(r["original"], r["title"]) for r in rows], [("x", "T")])
+
+    def test_a_truncated_array_keeps_the_complete_rows(self):
+        text = '[{"original": "a"}, {"original": "b"}, {"original": "c", "ti'
+        self.assertEqual([r["original"] for r in extract_json_array(text)], ["a", "b"])
+
+    def test_a_bare_object_is_one_row_not_its_nested_array(self):
+        """A one-file reply sent as an object must not yield its "categories"."""
+        text = ('{"original": "x", "title": "T", '
+                '"categories": [{"category": "A", "score": 90}]}')
+        rows = extract_json_array(text)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["original"], "x")
+
+    def test_rows_with_nested_arrays_parse_whole(self):
+        text = ('[{"original": "x", "categories": [{"category": "A"}]}, '
+                '{"original": "y", "categories": []}]')
+        self.assertEqual([r["original"] for r in extract_json_array(text)], ["x", "y"])
+
     def test_plain_array(self):
         self.assertEqual(extract_json_array('[{"a": 1}]'), [{"a": 1}])
 
@@ -65,8 +89,10 @@ class ExtractJsonArrayTest(unittest.TestCase):
         self.assertEqual(extract_json_array(""), [])
         self.assertEqual(extract_json_array(None), [])
 
-    def test_non_array_json_yields_empty(self):
-        self.assertEqual(extract_json_array('{"a": 1}'), [])
+    def test_scalar_json_yields_empty(self):
+        # A bare object is a one-row reply (see above); a bare scalar is not.
+        self.assertEqual(extract_json_array('"just a string"'), [])
+        self.assertEqual(extract_json_array('42'), [])
 
     def test_non_dict_entries_are_dropped(self):
         self.assertEqual(extract_json_array('[{"a": 1}, "junk", 7]'), [{"a": 1}])
@@ -96,6 +122,11 @@ class PromptTest(unittest.TestCase):
         out = categorized_titles_prompt(["x"], ["Bare"], {})
         self.assertIn("- Bare\n", out)
         self.assertNotIn("e.g.", out)
+
+    def test_categorized_prompt_asks_for_scored_candidates(self):
+        out = categorized_titles_prompt(["x"], ["Networking"], {})
+        self.assertIn("up to 3 candidate categories", out)
+        self.assertIn('"categories": [{"category": "<Category Name>", "score": <0-100>}]', out)
 
     def test_summaries_prompt_lists_titles(self):
         self.assertIn("1. Some Book", summaries_prompt(["Some Book"]))
@@ -160,6 +191,57 @@ class LookupClientTest(unittest.TestCase):
         stub = StubClient()
         self.assertEqual(LookupClient(self.cfg, stub).summaries([]), {})
         self.assertEqual(stub.responses.calls, [])
+
+    def _watched(self, client):
+        seen = []
+        lookup = LookupClient(self.cfg, client,
+                              on_call=lambda state, error: seen.append((state, error)))
+        return lookup, seen
+
+    def test_on_call_reports_busy_then_ok(self):
+        lookup, seen = self._watched(StubClient('[{"original": "raw", "title": "Real"}]'))
+        lookup.titles(["raw"])
+        self.assertEqual(seen, [("busy", None), ("ok", None)])
+
+    def test_an_unreadable_reply_is_logged(self):
+        import contextlib, io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            LookupClient(self.cfg, StubClient("no json here")).titles(["raw"])
+        self.assertIn("unreadable model reply: 'no json here'", err.getvalue())
+
+    def test_on_call_reports_unparseable_reply_as_error(self):
+        lookup, seen = self._watched(StubClient("nothing useful"))
+        lookup.titles(["raw"])
+        self.assertEqual(seen, [("busy", None), ("error", "Reply contained no JSON array")])
+
+    def test_on_call_reports_api_error_and_it_still_propagates(self):
+        class Boom:
+            class responses:
+                @staticmethod
+                def create(**kw):
+                    raise RuntimeError("401 unauthorized")
+
+        lookup, seen = self._watched(Boom())
+        with self.assertRaises(RuntimeError):
+            lookup.titles(["raw"])
+        self.assertEqual(seen, [("busy", None), ("error", "RuntimeError: 401 unauthorized")])
+
+    def test_on_call_fires_per_summary_batch(self):
+        lookup, seen = self._watched(StubClient(
+            '[{"title": "B0", "summary": "one"}]',
+            '[{"title": "B20", "summary": "two"}]',
+        ))
+        lookup.summaries([f"B{i}" for i in range(25)])
+        self.assertEqual([s for s, _ in seen], ["busy", "ok", "busy", "ok"])
+
+    def test_a_failing_on_call_does_not_break_the_lookup(self):
+        def broken(state, error):
+            raise ValueError("indicator bug")
+
+        stub = StubClient('[{"original": "raw", "title": "Real"}]')
+        rows = LookupClient(self.cfg, stub, on_call=broken).titles(["raw"])
+        self.assertEqual(rows, [{"original": "raw", "title": "Real"}])
 
     def test_client_is_lazy_so_no_key_is_needed_until_a_lookup_runs(self):
         # Constructing must not touch the (absent) config file or env.

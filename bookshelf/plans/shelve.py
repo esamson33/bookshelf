@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from ..catalog import Catalog
-from ..models import Proposal
+from ..models import Candidate, Proposal, parse_candidates
 from ..scan import categories, pdf_names, reconcile, sample_titles
 from .base import Context, Outcome, Plan, PlanError
 
@@ -62,13 +63,26 @@ def from_pending(ctx: Context) -> ShelvePlan:
     landing = ctx.config.landing_dir
     waiting = set(pdf_names(landing))
     proposals = [
-        Proposal.from_db(r["original_name"], r["filename"], r["summary"], row_id=r["id"])
+        Proposal.from_db(r["original_name"], r["filename"], r["summary"], row_id=r["id"],
+                         candidates=r["candidates"])
         for r in ctx.catalog.pending_rows(ctx.catalog.key(landing))
         # A proposal whose file was removed from __landing/ behind our back
         # would fail at apply(); drop it from the review instead.
         if r["original_name"] in waiting
     ]
     return ShelvePlan(proposals, landing, ctx.config.data_dir)
+
+
+def reply_candidates(row: dict) -> tuple[Candidate, ...]:
+    """The category suggestions in one lookup reply row, best first.
+
+    Falls back to a bare "category" (the reply shape before suggestions were
+    asked for) as a single unscored candidate.
+    """
+    candidates = parse_candidates(row.get("categories"))
+    if not candidates and row.get("category"):
+        candidates = parse_candidates([{"category": row["category"]}])
+    return candidates
 
 
 def build(ctx: Context, category: str, fresh: bool, publisher: str) -> ShelvePlan:
@@ -92,8 +106,10 @@ def build(ctx: Context, category: str, fresh: bool, publisher: str) -> ShelvePla
     found = reconcile(ctx.catalog, landing, all_pdfs)
 
     # A forced category overrides whatever a pending proposal stored, so the
-    # whole batch is filed consistently.
-    pending = [p.with_category(forced) if forced else p for p in found.pending]
+    # whole batch is filed consistently — and the model's suggestions, which
+    # the forced choice has made moot, go with it.
+    pending = [replace(p, category=forced, candidates=()) if forced else p
+               for p in found.pending]
     proposals: list[Proposal] = list(pending)
 
     if pending:
@@ -112,22 +128,36 @@ def build(ctx: Context, category: str, fresh: bool, publisher: str) -> ShelvePla
             results = ctx.lookup.categorized_titles(
                 found.stems, existing, sample_titles(data_dir, existing))
 
+        # A row without both keys cannot be matched to a file; leaving it out
+        # means that file falls back to its own name rather than crashing.
+        results = [r for r in results
+                   if isinstance(r.get("original"), str) and isinstance(r.get("title"), str)]
         if not results:
+            # API failures (bad key, no credit, network) raise before here;
+            # reaching this means the model answered with nothing usable.
             raise PlanError(
-                "Could not retrieve titles. Check your OPENAI_API_KEY and try again."
+                "The AI replied, but its answer had no usable titles. "
+                "Try the scan again; the reply is in the server's error log."
             )
 
-        titles = {r["original"]: r["title"] for r in results}
-        cats = {r["original"]: r.get("category", "Uncategorized") for r in results}
-        summaries = {r["original"]: r.get("summary", "") for r in results}
+        # Matched on the trimmed name: the model drops stray spaces, so a file
+        # like "Book (EX200) .pdf" would otherwise miss its own answer.
+        titles = {r["original"].strip(): r["title"] for r in results}
+        suggested = {r["original"].strip(): ([] if forced else reply_candidates(r)) for r in results}
+        summaries = {r["original"].strip(): r.get("summary", "") for r in results}
 
         for fname in found.unknown:
             stem = Path(fname).stem
+            candidates = tuple(suggested.get(stem.strip(), ()))
             proposals.append(Proposal.from_title(
                 original_name=fname,
-                title=titles.get(stem, stem),
-                summary=summaries.get(stem, ""),
-                category=forced or cats.get(stem, "Uncategorized"),
+                title=titles.get(stem.strip(), stem),
+                summary=summaries.get(stem.strip(), ""),
+                # The best suggestion is the default, so a review that touches
+                # nothing files the book exactly as before.
+                category=forced or (candidates[0].category if candidates
+                                    else "Uncategorized"),
+                candidates=candidates,
             ))
     elif not pending:
         return ShelvePlan(

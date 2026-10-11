@@ -119,10 +119,20 @@ def is_loopback(authority: str) -> bool:
 
 # ── data access ──────────────────────────────────────────────────────────────
 
+#: The latest OpenAI call state, so a page opened mid-call can show it busy.
+AI_STATE: dict = {"state": "idle", "error": None}
+
+
+def _ai_event(state: str, error: str | None) -> None:
+    """LookupClient's on_call hook: push each call's state to the page."""
+    AI_STATE.update(state=state, error=error)
+    JOBS.publish({"type": "ai", "state": state, "error": error})
+
+
 def lookup_client() -> LookupClient:
     global LOOKUP
     if LOOKUP is None:
-        LOOKUP = LookupClient(CATALOG.config)
+        LOOKUP = LookupClient(CATALOG.config, on_call=_ai_event)
     return LOOKUP
 
 
@@ -473,6 +483,8 @@ class Handler(BaseHTTPRequestHandler):
             running = JOBS.snapshot()
             if running:
                 self._sse_event({"type": "job", **running})
+            if AI_STATE["state"] == "busy":
+                self._sse_event({"type": "ai", **AI_STATE})
             while True:
                 try:
                     event = subscription.get(timeout=SSE_KEEPALIVE)
@@ -752,8 +764,15 @@ class Handler(BaseHTTPRequestHandler):
         # An absent "filenames" means every group; an empty list means none,
         # which is a no-op rather than a silent delete-everything.
         filenames = body.get("filenames")
-        plan = dedupe_plan.build(context()).select(
-            filenames, include_stale=bool(body.get("stale", True)))
+        keep = body.get("keep") or {}
+        if not isinstance(keep, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in keep.items()):
+            return self._bad_request("'keep' must map filenames to paths.")
+        try:
+            plan = dedupe_plan.build(context()).select(
+                filenames, include_stale=bool(body.get("stale", True)), keep=keep)
+        except ValueError as e:
+            return self._bad_request(str(e))
         if plan.is_empty():
             return self._bad_request("Nothing selected to remove.")
         lines: list[str] = []
@@ -794,7 +813,8 @@ class Handler(BaseHTTPRequestHandler):
 
         body = self._json_body()
         proposal = Proposal.from_db(row["original_name"], row["filename"],
-                                    row["summary"] or "", row_id=row["id"])
+                                    row["summary"] or "", row_id=row["id"],
+                                    candidates=row["candidates"])
 
         if "title" in body:
             title = str(body["title"] or "").strip()

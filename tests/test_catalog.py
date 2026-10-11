@@ -44,7 +44,8 @@ class MigrationTest(CatalogTestCase):
         cat = self.open()
         self.assertEqual(cat.migrate(), 0)
         self.assertEqual(cat._existing_table(), "books")
-        self.assertLessEqual({"filename", "summary", "accessed_at"}, cat._columns())
+        self.assertLessEqual({"filename", "summary", "accessed_at", "candidates"},
+                             cat._columns())
         self.assertNotIn("proposed_name", cat._columns())
         self.assertEqual(cat.applied_count(), 0)
 
@@ -186,7 +187,7 @@ class QueryTest(CatalogTestCase):
         self.cat.stage("Networking", [
             Proposal("raw.pdf", "Real.pdf", "s"),
         ])
-        self.assertEqual(self.cat.pending("Networking"), {"raw.pdf": ("Real.pdf", "s")})
+        self.assertEqual(self.cat.pending("Networking"), {"raw.pdf": ("Real.pdf", "s", None)})
         self.assertEqual(self.cat.applied_names("Networking"), set())
 
     def test_stage_applied_stamps_applied_at(self):
@@ -199,7 +200,7 @@ class QueryTest(CatalogTestCase):
     def test_stage_upserts_on_conflict(self):
         self.cat.stage("Networking", [Proposal("a.pdf", "First.pdf", "one")])
         self.cat.stage("Networking", [Proposal("a.pdf", "Second.pdf", "two")])
-        self.assertEqual(self.cat.pending("Networking"), {"a.pdf": ("Second.pdf", "two")})
+        self.assertEqual(self.cat.pending("Networking"), {"a.pdf": ("Second.pdf", "two", None)})
 
     def test_mark_applied_moves_row_out_of_pending(self):
         self.cat.stage("Networking", [Proposal("a.pdf", "A.pdf")])

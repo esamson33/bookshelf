@@ -6,7 +6,7 @@ from pathlib import Path
 
 from bookshelf.catalog import Catalog
 from bookshelf.config import Config
-from bookshelf.models import Proposal
+from bookshelf.models import Candidate, Proposal
 from bookshelf.plans import Context, PlanError
 from bookshelf.plans import dedupe as dedupe_plan
 from bookshelf.plans import rename as rename_plan
@@ -221,6 +221,55 @@ class ShelvePlanTest(PlanTestCase):
         self.assertEqual(plan.proposals[0].filename, "Fresh.pdf")
         self.assertIn("Cleared 1 previously proposed move(s); starting fresh.", self.printed)
 
+    def suggest(self, *candidates):
+        (self.landing / "raw.pdf").write_bytes(b"%PDF")
+        return StubLookup(categorized=[{"original": "raw", "title": "Real", "summary": "s",
+                                        "categories": list(candidates)}])
+
+    def test_reply_rows_missing_original_are_ignored_not_fatal(self):
+        (self.landing / "raw.pdf").write_bytes(b"%PDF")
+        lookup = StubLookup(categorized=[{"category": "A", "score": 90}])
+        with self.assertRaises(PlanError):
+            shelve_plan.build(self.context(lookup), "", False, "")
+
+    def test_a_stem_with_a_stray_space_still_matches_its_reply(self):
+        (self.landing / "Book (EX200) .pdf").write_bytes(b"%PDF")
+        lookup = StubLookup(categorized=[{"original": "Book (EX200)", "title": "Real",
+                                          "categories": [{"category": "Linux", "score": 90}]}])
+        proposal = shelve_plan.build(self.context(lookup), "", False, "").proposals[0]
+        self.assertEqual((proposal.filename, proposal.category), ("Real.pdf", "Linux"))
+
+    def test_the_best_suggestion_is_the_default_category(self):
+        lookup = self.suggest({"category": "Databases", "score": 40},
+                              {"category": "Data Science", "score": 85})
+        proposal = shelve_plan.build(self.context(lookup), "", False, "").proposals[0]
+        self.assertEqual(proposal.category, "Data Science")
+        self.assertEqual(proposal.candidates, (Candidate("Data Science", 85),
+                                               Candidate("Databases", 40)))
+
+    def test_suggestions_survive_staging_and_reach_the_payload(self):
+        lookup = self.suggest({"category": "Databases", "score": 90},
+                              {"category": "Systems", "score": 55})
+        shelve_plan.build(self.context(lookup), "", False, "").stage(self.cat)
+
+        row = shelve_plan.from_pending(self.context()).payload()["rows"][0]
+        self.assertEqual(row["candidates"], [{"category": "Databases", "score": 90},
+                                             {"category": "Systems", "score": 55}])
+
+    def test_suggestions_survive_a_rescan_that_reshows_the_proposal(self):
+        lookup = self.suggest({"category": "Databases", "score": 90})
+        shelve_plan.build(self.context(lookup), "", False, "").stage(self.cat)
+
+        proposal = shelve_plan.build(self.context(), "", False, "").proposals[0]
+        self.assertEqual(proposal.candidates, (Candidate("Databases", 90),))
+
+    def test_a_forced_category_drops_the_suggestions(self):
+        lookup = self.suggest({"category": "Databases", "score": 90})
+        shelve_plan.build(self.context(lookup), "", False, "").stage(self.cat)
+
+        proposal = shelve_plan.build(self.context(), "Forced", False, "").proposals[0]
+        self.assertEqual((proposal.category, proposal.candidates), ("Forced", ()))
+
     def test_payload_carries_the_category_and_title_separately(self):
         plan = shelve_plan.ShelvePlan([Proposal("raw.pdf", "R.pdf", "why", "Old")],
                                       self.landing, self.data)
@@ -270,6 +319,7 @@ class ShelvePlanTest(PlanTestCase):
         self.assertTrue((self.data / "Networking" / "Real.pdf").is_file())
         self.assertEqual(self.cat.pending(self.cat.key(self.landing)), {})
         self.assertEqual(self.cat.all_books()[0]["summary"], "keep me")
+        self.assertIsNone(self.cat._conn.execute("SELECT candidates FROM books").fetchone()[0])
 
 
 class DedupePlanTest(PlanTestCase):
@@ -336,6 +386,111 @@ class DedupePlanTest(PlanTestCase):
         self.touch("__landing/dup.pdf")
         self.touch("Networking/dup.pdf")
         self.assertEqual(dedupe_plan.build(self.context()).duplicates, [])
+
+    def test_identical_files_with_different_names_are_duplicates(self):
+        self.touch("General/Book (EX200) .pdf", b"%PDF same bytes")
+        self.touch("Linux/Book Cert Guide: EX200.pdf", b"%PDF same bytes")
+        plan = dedupe_plan.build(self.context())
+        self.assertEqual(len(plan.duplicates), 1)
+        self.assertEqual(plan.duplicates[0].match, "content")
+        copies = plan.payload()["duplicates"][0]["copies"]
+        self.assertEqual(sorted(c["name"] for c in copies),
+                         ["Book (EX200) .pdf", "Book Cert Guide: EX200.pdf"])
+
+    def test_same_size_but_different_contents_are_not_duplicates(self):
+        self.touch("A/one.pdf", b"%PDF aaaa")
+        self.touch("B/two.pdf", b"%PDF bbbb")
+        self.assertEqual(dedupe_plan.build(self.context()).duplicates, [])
+
+    def test_a_name_match_and_a_content_match_form_one_group(self):
+        self.touch("A/dup.pdf", b"%PDF x")
+        self.touch("B/dup.pdf", b"%PDF other")
+        self.touch("C/renamed.pdf", b"%PDF x")
+        plan = dedupe_plan.build(self.context())
+        self.assertEqual(len(plan.duplicates), 1)
+        self.assertEqual(plan.duplicates[0].match, "name and content")
+        self.assertEqual(len(plan.duplicates[0].remove), 2)
+
+    def test_keeping_a_differently_named_copy_removes_the_others_rows(self):
+        self.touch("General/raw .pdf", b"%PDF same")
+        self.touch("Linux/Proper.pdf", b"%PDF same")
+        for category, name, when in (("General", "raw .pdf", "2026-10-07 11:49:17"),
+                                     ("Linux", "Proper.pdf", "2026-10-11 08:58:19")):
+            self.cat._conn.execute(
+                "INSERT INTO books (directory, original_name, filename, status, applied_at)"
+                " VALUES (?, ?, ?, 'applied', ?)", (category, name, name, when))
+        self.cat.commit()
+        plan = dedupe_plan.build(self.context())
+        self.assertEqual(plan.duplicates[0].keep.name, "raw .pdf")    # earliest by default
+
+        plan.select(keep={"raw .pdf": "Linux/Proper.pdf"}).apply(self.cat)
+
+        self.assertFalse((self.data / "General" / "raw .pdf").exists())
+        self.assertEqual([b["filename"] for b in self.cat.all_books()], ["Proper.pdf"])
+
+    def test_a_title_plus_subtitle_is_a_possible_duplicate(self):
+        self.touch("Graphics/Computer Graphics from Scratch.pdf", b"%PDF big scan")
+        self.touch("Graphics/Computer Graphics from Scratch: A Programmer's Intro.pdf", b"%PDF other")
+        d = dedupe_plan.build(self.context()).duplicates[0]
+        self.assertEqual((d.match, d.needs_review), ("title", True))
+
+    def test_titles_sharing_only_a_main_title_do_not_match(self):
+        self.touch("A/Python: Data Analysis.pdf", b"%PDF 1")
+        self.touch("B/Python: Web Scraping.pdf", b"%PDF 22")
+        self.assertEqual(dedupe_plan.build(self.context()).duplicates, [])
+
+    def test_different_editions_numbers_do_not_match(self):
+        self.touch("A/Red Hat RHCSA 9 Cert Guide EX200.pdf", b"%PDF 1")
+        self.touch("B/Red Hat RHCSA 10 Cert Guide: EX200.pdf", b"%PDF 22")
+        self.assertEqual(dedupe_plan.build(self.context()).duplicates, [])
+
+    def test_a_leading_article_and_punctuation_are_ignored(self):
+        self.touch("A/An Introduction to X.pdf", b"%PDF 1")
+        self.touch("B/Introduction to X: With Y.pdf", b"%PDF 22")
+        self.assertEqual(len(dedupe_plan.build(self.context()).duplicates), 1)
+
+    def test_select_all_leaves_title_matches_alone(self):
+        self.touch("Graphics/Computer Graphics from Scratch.pdf", b"%PDF 1")
+        self.touch("Graphics/Computer Graphics from Scratch: Subtitle.pdf", b"%PDF 22")
+        self.touch("Networking/dup.pdf")
+        self.touch("Systems/dup.pdf")
+        plan = dedupe_plan.build(self.context())
+        self.assertEqual([d.filename for d in plan.select().duplicates], ["dup.pdf"])
+        named = plan.select(filenames=[d.filename for d in plan.duplicates])
+        self.assertEqual(len(named.duplicates), 2)
+
+    def two_filed_copies(self):
+        self.touch("Networking/dup.pdf")
+        self.touch("Systems/dup.pdf")
+        for category, when in (("Networking", "2026-01-01 00:00:00"),
+                               ("Systems", "2026-06-01 00:00:00")):
+            self.cat._conn.execute(
+                "INSERT INTO books (directory, original_name, filename, status, applied_at)"
+                " VALUES (?, 'dup.pdf', 'dup.pdf', 'applied', ?)", (category, when))
+        self.cat.commit()
+        return dedupe_plan.build(self.context())
+
+    def test_payload_lists_every_copy_earliest_first_with_its_date(self):
+        copies = self.two_filed_copies().payload()["duplicates"][0]["copies"]
+        self.assertEqual([(c["category"], c["added"]) for c in copies],
+                         [("Networking", "2026-01-01 00:00:00"),
+                          ("Systems", "2026-06-01 00:00:00")])
+
+    def test_keeping_the_newer_copy_removes_the_older_and_its_row(self):
+        plan = self.two_filed_copies().select(keep={"dup.pdf": "Systems/dup.pdf"})
+        d = plan.duplicates[0]
+        self.assertEqual((d.keep.parent.name, [p.parent.name for p in d.remove]),
+                         ("Systems", ["Networking"]))
+
+        plan.apply(self.cat)
+
+        self.assertTrue((self.data / "Systems" / "dup.pdf").is_file())
+        self.assertFalse((self.data / "Networking" / "dup.pdf").exists())
+        self.assertEqual([b["category"] for b in self.cat.all_books()], ["Systems"])
+
+    def test_keeping_an_unknown_path_raises(self):
+        with self.assertRaises(ValueError):
+            self.two_filed_copies().select(keep={"dup.pdf": "Elsewhere/dup.pdf"})
 
     def test_apply_deletes_files_and_rows(self):
         self.touch("Networking/dup.pdf")

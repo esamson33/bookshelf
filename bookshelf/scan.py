@@ -42,12 +42,17 @@ def collect_pdfs(root: Path, recursive: bool) -> list[tuple[Path, list[str]]]:
 
 
 def categories(data_dir: Path) -> list[str]:
-    """Sorted category directory names, excluding hidden and helper dirs."""
+    """Sorted category directory names, excluding hidden and helper dirs.
+
+    A category left with no PDFs (its last book deduplicated or archived away)
+    is not offered: its directory stays on disk, but it is left out of the
+    category list and the lookup prompt until a book is filed into it again.
+    """
     if not data_dir.is_dir():
         return []
     return sorted(
         d.name for d in data_dir.iterdir()
-        if d.is_dir() and not d.name.startswith((".", "_"))
+        if d.is_dir() and not d.name.startswith((".", "_")) and pdf_names(d)
     )
 
 
@@ -92,7 +97,8 @@ def reconcile(catalog: Catalog, directory: Path, filenames: list[str]) -> Reconc
         directory=directory,
         applied=sum(1 for f in filenames if f in applied),
         pending=[
-            Proposal.from_db(f, *pending[f]) for f in filenames if f in pending
+            Proposal.from_db(f, pending[f][0], pending[f][1], candidates=pending[f][2])
+            for f in filenames if f in pending
         ],
         unknown=[f for f in filenames if f not in applied and f not in pending],
     )

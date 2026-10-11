@@ -38,7 +38,11 @@
                   picker: null};
   let DEDUPE = null;
   let ARCHIVE = [];              // books taken off the shelf, from /api/archive
-  let SKIP = new Set();          // duplicate groups the user unticked
+  //: Duplicate groups whose tick the user flipped from its default. Groups
+  //: start ticked, except those matched on title alone — different files —
+  //: which start unticked, so nothing in them goes without a deliberate tick.
+  let FLIPPED = new Set();
+  let KEEP = new Map();          // duplicate filename -> path of the copy to keep
   let KEEP_STALE = true;
 
   // What Reset puts everything back to. Held apart from the state itself so
@@ -49,7 +53,7 @@
   const dirty = () =>
     Object.keys(FORM_DEFAULTS).some(k => FORM[k] !== FORM_DEFAULTS[k]) ||
     Object.keys(RENAME_DEFAULTS).some(k => RENAME[k] !== RENAME_DEFAULTS[k]) ||
-    RENAME.picker !== null || SKIP.size > 0 || !KEEP_STALE || FLASH !== null;
+    RENAME.picker !== null || FLIPPED.size > 0 || KEEP.size > 0 || !KEEP_STALE || FLASH !== null;
 
   // Clears what was typed and ticked on this page, and nothing else. Staged
   // proposals are catalog rows, not form data: they stay, and a rename batch
@@ -58,7 +62,8 @@
   function resetForms() {
     Object.assign(FORM, FORM_DEFAULTS);
     Object.assign(RENAME, RENAME_DEFAULTS, {groups: [], picker: null});
-    SKIP = new Set();
+    FLIPPED = new Set();
+    KEEP = new Map();
     KEEP_STALE = true;
     FLASH = null;
     render();
@@ -227,16 +232,46 @@
     } catch (e) { fail(e); }
   }
 
+  // The copy of a duplicate group the user picked to keep, or the server's
+  // default (the earliest filed). A pick that no longer names one of the
+  // group's copies — the files changed underneath — falls back to the default.
+  function keptPath(group) {
+    const picked = KEEP.get(group.filename);
+    return group.copies.some(c => c.path === picked) ? picked : group.keep;
+  }
+
+  const isIncluded = group => !group.review !== FLIPPED.has(group.filename);
+
+  const megabytes = bytes => bytes == null ? '' : `${(bytes / 1e6).toFixed(1)} MB`;
+
+  const categoryOf = (group, path) =>
+    (group.copies.find(c => c.path === path) || {category: path}).category;
+
   async function applyDedupe() {
+    const chosen = DEDUPE.duplicates.filter(isIncluded);
+    // Name every file before it goes: the deletion is permanent, and this is
+    // the last point at which a wrong pick can be caught.
+    const lines = chosen.map(d => {
+      const kept = keptPath(d);
+      const gone = d.copies.filter(c => c.path !== kept).map(c => `  ✗ ${c.path}`);
+      return `${d.filename}\n  ✓ keep ${kept}\n${gone.join('\n')}`;
+    });
+    if (KEEP_STALE && DEDUPE.stale.length) {
+      lines.push(`${DEDUPE.stale.length} catalog row(s) with no file on disk`);
+    }
+    if (!confirm(`Delete for good?\n\n${lines.join('\n\n')}\n\nThis cannot be undone.`)) return;
     FLASH = null;
-    const filenames = DEDUPE.duplicates
-      .map(d => d.filename).filter(name => !SKIP.has(name));
+    const filenames = chosen.map(d => d.filename);
+    // Always name the kept copy, even the default, so what is deleted is
+    // exactly what the page showed.
+    const keep = Object.fromEntries(chosen.map(d => [d.filename, keptPath(d)]));
     try {
       const result = await postJSON('/api/dedupe/apply',
-                                    {filenames, stale: KEEP_STALE});
+                                    {filenames, keep, stale: KEEP_STALE});
       FLASH = {text: result.summary + (result.lines.length ? '\n' + result.lines.join('\n') : ''),
                bad: result.errors > 0};
-      SKIP = new Set();
+      FLIPPED = new Set();
+      KEEP = new Map();
       await Promise.all([refreshDedupe(), refreshStatus()]);
       render();
     } catch (e) { fail(e); }
@@ -329,6 +364,43 @@
     return zone;
   }
 
+  // The model's category suggestions for one book, best first, each with how
+  // well it thinks the category fits. Picking one saves it as the category —
+  // the same path as typing it into the field.
+  function candidateChips(row, input) {
+    const known = new Set(CATEGORIES.map(c => c.toLowerCase()));
+    const box = el('div', {className: 'candidates', role: 'group',
+                           'aria-label': 'Suggested categories'});
+    box.append(el('span', {className: 'label', textContent: 'Suggested'}));
+
+    row.candidates.forEach(c => {
+      const scored = typeof c.score === 'number';
+      const isNew = !known.has(c.category.toLowerCase());
+      const chosen = c.category === row.category;
+      const chip = el('button', {type: 'button',
+        className: `chip${chosen ? ' chosen' : ''}`,
+        title: `${c.category}${isNew ? ' (new category)' : ''}` +
+               (scored ? ` — the model rates this ${c.score}% appropriate` : ''),
+        'aria-pressed': String(chosen)});
+      chip.append(el('span', {className: 'name', textContent: c.category}));
+      if (isNew) chip.append(el('span', {className: 'new', textContent: 'new'}));
+      if (scored) {
+        const meter = el('span', {className: 'meter'});
+        meter.append(el('span', {className: 'fill'}));
+        meter.firstChild.style.width = `${c.score}%`;
+        chip.append(meter, el('span', {className: 'pct', textContent: `${c.score}%`}));
+      }
+      chip.addEventListener('click', async () => {
+        if (chosen) return;
+        input.value = c.category;
+        await saveField(input, row, 'category');
+        box.replaceWith(candidateChips(row, input));
+      });
+      box.append(chip);
+    });
+    return box;
+  }
+
   function proposalRow(row) {
     const node = el('div', {className: 'row'});
     node.append(el('div', {className: 'from', textContent: `from ${row.original}`}));
@@ -341,8 +413,13 @@
     if (row.category !== null) {
       const category = el('input', {type: 'text', value: row.category,
                                     list: 'categoryList', 'aria-label': 'Category'});
-      category.addEventListener('change', () => saveField(category, row, 'category'));
+      category.addEventListener('change', async () => {
+        await saveField(category, row, 'category');
+        const chips = node.querySelector('.candidates');
+        if (chips) chips.replaceWith(candidateChips(row, category));
+      });
       node.append(category);
+      if (row.candidates && row.candidates.length) node.append(candidateChips(row, category));
     } else {
       node.append(el('div'));
     }
@@ -364,6 +441,7 @@
       heading.append(el('span', {className: 'tag',
         textContent: `${STATUS.unclassified} waiting`}));
     }
+    if (window.AiStatus) heading.append(AiStatus.element);
     panel.append(heading);
     panel.append(el('p', {className: 'lede',
       textContent: 'Books land here first, then get a looked-up title and a category before being filed onto the shelf.'}));
@@ -533,30 +611,87 @@
     if (total) heading.append(el('span', {className: 'tag', textContent: `${total} to remove`}));
     panel.append(heading);
     panel.append(el('p', {className: 'lede',
-      textContent: 'The same book filed under two categories, and catalog rows whose file is gone. The oldest copy of each is the one kept.'}));
+      textContent: 'The same book filed under more than one category, and catalog rows whose file is gone. ' +
+                   'Choose the copy to keep; the others are deleted. The earliest filed copy is chosen to start with.'}));
 
     if (!DEDUPE || (!DEDUPE.duplicates.length && !DEDUPE.stale.length)) {
       panel.append(el('div', {className: 'lede', textContent: 'Nothing duplicated, nothing stale.'}));
       return panel;
     }
 
-    DEDUPE.duplicates.forEach(group => {
+    DEDUPE.duplicates.forEach((group, index) => {
       const node = el('div', {className: 'dupe'});
-      const box = el('input', {type: 'checkbox', checked: !SKIP.has(group.filename),
+      const included = isIncluded(group);
+      const box = el('input', {type: 'checkbox', checked: included,
                                'aria-label': `Remove duplicates of ${group.filename}`});
       box.addEventListener('change', () => {
-        if (box.checked) SKIP.delete(group.filename); else SKIP.add(group.filename);
+        if (FLIPPED.has(group.filename)) FLIPPED.delete(group.filename);
+        else FLIPPED.add(group.filename);
         render();
       });
       node.append(box);
       const body = el('div', {className: 'body'});
-      body.append(el('div', {className: 'name', textContent: group.filename}));
-      const paths = el('div', {className: 'paths'});
-      paths.append(el('div', {className: 'keep', innerHTML:
-        `<b>KEEP</b> &nbsp;${esc(group.keep)}`}));
-      group.remove.forEach(r => paths.append(el('div', {className: 'gone', innerHTML:
-        `<b>GO</b> &nbsp;&nbsp;&nbsp;${esc(r.path)}${r.tracked ? '  (and its catalog row)' : ''}`})));
-      body.append(paths);
+      // Copies grouped by identical contents can carry different names, so the
+      // heading says why they are one book and each copy shows its own name.
+      const named = new Set(group.copies.map(c => c.name)).size > 1;
+      body.append(el('div', {className: 'name',
+        textContent: named ? group.copies[group.copies.length - 1].name.replace(/\.pdf$/i, '')
+                           : group.filename}));
+      body.append(el('div', {className: 'why', textContent: {
+        'name': 'Same filename',
+        'content': 'Identical files under different names',
+        'name and content': 'Same filename or identical file',
+      }[group.match] || (group.review
+        ? 'Same title, but different files — maybe another edition or scan. Open each to compare.'
+        : 'Same filename')}));
+
+      // One button per copy, each saying what tapping it does — "Keep this
+      // copy". The verdict is spelled out below as plain text, so nothing
+      // that reads like a status can be tapped and silently mean the opposite.
+      const kept = keptPath(group);
+      const copies = el('div', {className: 'copies', role: 'group',
+                                'aria-label': `Which copy of ${group.filename} to keep`});
+      group.copies.forEach((copy, i) => {
+        const keeping = copy.path === kept;
+        // A card, not one big button: it holds two controls — keep this copy,
+        // open it to compare — and a link cannot live inside a button.
+        const choice = el('div', {className: `copy${keeping ? ' chosen' : ''}${included ? '' : ' off'}`,
+                                  title: copy.path});
+        const pick = el('button', {type: 'button', className: 'action', disabled: !included,
+          'aria-pressed': String(keeping),
+          'aria-label': `Keep the copy in ${copy.category}`,
+          textContent: keeping ? '✓ Keeping this copy' : 'Keep this copy'});
+        pick.addEventListener('click', () => {
+          if (keeping) return;
+          KEEP.set(group.filename, copy.path);
+          render();
+        });
+        choice.append(pick);
+        choice.append(el('span', {className: 'category', textContent: copy.category}));
+        if (named) choice.append(el('span', {className: 'file', textContent: copy.name}));
+        const meta = el('span', {className: 'meta', textContent:
+          [copy.added ? `filed ${copy.added.slice(0, 10)}` : 'not in the catalog',
+           megabytes(copy.size)].filter(Boolean).join(' · ')});
+        if (copy.added && i === 0) meta.append(el('span', {className: 'age', textContent: 'oldest'}));
+        else if (copy.added && i === group.copies.length - 1) {
+          meta.append(el('span', {className: 'age', textContent: 'newest'}));
+        }
+        choice.append(meta);
+        if (copy.id != null) {
+          choice.append(el('a', {className: 'open', href: `/pdf/${copy.id}`, target: '_blank',
+                                 rel: 'noopener', textContent: 'Open ↗'}));
+        }
+        copies.append(choice);
+      });
+      body.append(copies);
+
+      const goners = group.copies.filter(c => c.path !== kept);
+      body.append(el('div', {className: 'outcome', textContent: included
+        ? `Keeps ${categoryOf(group, kept)} · deletes ${goners.map(c => c.category).join(', ')}` +
+          (goners.some(c => c.tracked) ? ' (and its catalog row)' : '')
+        : group.review ? 'Left alone until you tick it — these are different files.'
+                       : 'Left alone — tick the box to deal with this one.'}));
+      body.append(copies);
       node.append(body);
       panel.append(node);
     });
@@ -580,9 +715,10 @@
     // Files and catalog rows are removed independently — a duplicate can have
     // no row at all, and a stale row has no file — so the button counts both
     // or it reads "Delete 0 files" while still about to drop rows.
-    const chosen = DEDUPE.duplicates.filter(d => !SKIP.has(d.filename));
-    const files = chosen.reduce((n, d) => n + d.remove.length, 0);
-    const records = chosen.reduce((n, d) => n + d.remove.filter(r => r.tracked).length, 0)
+    const chosen = DEDUPE.duplicates.filter(isIncluded);
+    const files = chosen.reduce((n, d) => n + d.copies.length - 1, 0);
+    const records = chosen.reduce((n, d) =>
+                      n + d.copies.filter(c => c.tracked && c.path !== keptPath(d)).length, 0)
                     + (KEEP_STALE ? DEDUPE.stale.length : 0);
     const parts = [];
     if (files) parts.push(`${files} file${files === 1 ? '' : 's'}`);

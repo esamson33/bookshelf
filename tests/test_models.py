@@ -3,7 +3,7 @@
 
 import unittest
 
-from bookshelf.models import Proposal
+from bookshelf.models import Candidate, Proposal, candidates_json, parse_candidates
 
 
 class DbValueTest(unittest.TestCase):
@@ -90,6 +90,47 @@ class WithCategoryTest(unittest.TestCase):
 
     def test_can_add_a_category_to_a_bare_proposal(self):
         self.assertEqual(Proposal("raw.pdf", "T.pdf").with_category("C").db_value, "C/T.pdf")
+
+
+
+class CandidatesTest(unittest.TestCase):
+    def test_sorted_best_first_and_capped_at_three(self):
+        got = parse_candidates([{"category": c, "score": n} for c, n in
+                                [("A", 10), ("B", 90), ("C", 50), ("D", 70)]])
+        self.assertEqual(got, (Candidate("B", 90), Candidate("D", 70), Candidate("C", 50)))
+
+    def test_scores_are_clamped_and_rounded(self):
+        got = parse_candidates([{"category": "A", "score": 140},
+                                {"category": "B", "score": "72.6"},
+                                {"category": "C", "score": -5}])
+        self.assertEqual([c.score for c in got], [100, 73, 0])
+
+    def test_unusable_scores_become_none_and_sort_last(self):
+        got = parse_candidates([{"category": "A", "score": "high"},
+                                {"category": "B", "score": True},
+                                {"category": "C", "score": 20}])
+        self.assertEqual(got, (Candidate("C", 20), Candidate("A"), Candidate("B")))
+
+    def test_bad_names_and_case_insensitive_repeats_are_dropped(self):
+        got = parse_candidates([{"category": " Networking ", "score": 80},
+                                {"category": "networking", "score": 95},
+                                {"category": "a/b", "score": 90},
+                                {"category": "", "score": 90}, "junk"])
+        self.assertEqual(got, (Candidate("Networking", 80),))
+
+    def test_json_round_trip(self):
+        cands = (Candidate("A", 90), Candidate("B", None))
+        self.assertEqual(parse_candidates(candidates_json(cands)), cands)
+        self.assertIsNone(candidates_json(()))
+
+    def test_garbage_json_yields_nothing(self):
+        self.assertEqual(parse_candidates("not json"), ())
+        self.assertEqual(parse_candidates('{"category": "A"}'), ())
+
+    def test_from_db_reads_stored_candidates(self):
+        p = Proposal.from_db("raw.pdf", "A/Real.pdf", "", candidates='[{"category": "A", "score": 60}]')
+        self.assertEqual(p.candidates, (Candidate("A", 60),))
+        self.assertEqual(p.as_row()["candidates"], [{"category": "A", "score": 60}])
 
 
 if __name__ == "__main__":

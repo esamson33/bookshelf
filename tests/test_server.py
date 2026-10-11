@@ -313,6 +313,36 @@ class EventStreamTest(ServerTestCase):
             frame = self.read_frame(response).strip()
         self.assertEqual(json.loads(frame[len("data:"):]), {"type": "books"})
 
+    def test_ai_events_are_published_and_remembered(self):
+        self.addCleanup(server.AI_STATE.update, dict(server.AI_STATE))
+        subscription = JOBS.subscribe()
+        self.addCleanup(JOBS.unsubscribe, subscription)
+        server._ai_event("error", "RuntimeError: boom")
+        self.assertEqual(subscription.get(timeout=1),
+                         {"type": "ai", "state": "error", "error": "RuntimeError: boom"})
+        self.assertEqual(server.AI_STATE, {"state": "error", "error": "RuntimeError: boom"})
+
+    def test_lookup_client_reports_calls_to_the_page(self):
+        self._saved_lookup, server.LOOKUP = server.LOOKUP, None
+        self.addCleanup(setattr, server, "LOOKUP", self._saved_lookup)
+        self.assertIs(server.lookup_client().on_call, server._ai_event)
+
+    def test_a_call_in_flight_is_replayed_to_a_new_stream(self):
+        self.addCleanup(server.AI_STATE.update, dict(server.AI_STATE))
+        server.AI_STATE.update(state="busy", error=None)
+        response = self.stream()
+        self.read_frame(response)                      # ": connected"
+        frame = self.read_frame(response).strip()
+        self.assertEqual(json.loads(frame[len("data:"):]),
+                         {"type": "ai", "state": "busy", "error": None})
+
+    def test_a_finished_call_is_not_replayed(self):
+        self.addCleanup(server.AI_STATE.update, dict(server.AI_STATE))
+        server.AI_STATE.update(state="ok", error=None)
+        response = self.stream()
+        self.read_frame(response)                      # ": connected"
+        self.assertEqual(self.read_frame(response).strip(), ": keepalive")
+
     def test_closing_the_stream_drops_the_subscription(self):
         """Otherwise every page reload would leak a queue and a thread."""
         def ids():
@@ -408,8 +438,14 @@ class StatusTest(ManageTestCase):
 
     def test_categories_lists_the_shelf_directories(self):
         (self.data / "Systems").mkdir()
+        (self.data / "Systems" / "b.pdf").write_bytes(b"%PDF")
         self.assertEqual(self.get_json("/api/categories")["categories"],
                          ["Networking", "Systems"])
+
+    def test_an_emptied_category_is_hidden_but_not_deleted(self):
+        (self.data / "Empty").mkdir()
+        self.assertNotIn("Empty", self.get_json("/api/categories")["categories"])
+        self.assertTrue((self.data / "Empty").is_dir())
 
     def test_landing_names_the_waiting_files(self):
         self.drop_in("b.pdf")
@@ -513,7 +549,7 @@ class ShelveScanTest(ManageTestCase):
         self.post("/api/shelve/scan", {})
         job = self.await_job()
         self.assertEqual(job["state"], "error")
-        self.assertIn("Could not retrieve titles", job["error"])
+        self.assertIn("no usable titles", job["error"])
 
     def test_a_second_job_is_refused_while_one_runs(self):
         release = threading.Event()
@@ -682,6 +718,31 @@ class DedupeTest(ManageTestCase):
         status, _ = self.post("/api/dedupe/apply", {"filenames": [], "stale": False})
         self.assertEqual(status, 400)
         self.assertTrue((self.data / "Systems" / "dup.pdf").is_file())
+
+    def test_the_chosen_copy_is_the_one_kept(self):
+        """Either copy can be kept — not only the earliest filed."""
+        group = self.get_json("/api/dedupe")["duplicates"][0]
+        other = next(c["path"] for c in group["copies"] if c["path"] != group["keep"])
+
+        status, _ = self.post("/api/dedupe/apply",
+                              {"filenames": ["dup.pdf"], "keep": {"dup.pdf": other}})
+
+        self.assertEqual(status, 200)
+        self.assertTrue((self.data / other).is_file())
+        self.assertFalse((self.data / group["keep"]).exists())
+
+    def test_keeping_a_path_outside_the_group_is_refused(self):
+        status, _ = self.post("/api/dedupe/apply",
+                              {"filenames": ["dup.pdf"], "keep": {"dup.pdf": "Real.pdf"}})
+        self.assertEqual(status, 400)
+        self.assertTrue((self.data / "Networking" / "dup.pdf").is_file())
+        self.assertTrue((self.data / "Systems" / "dup.pdf").is_file())
+
+    def test_a_category_emptied_by_dedupe_stays_on_disk(self):
+        self.post("/api/dedupe/apply",
+                  {"filenames": ["dup.pdf"], "keep": {"dup.pdf": "Networking/dup.pdf"}})
+        self.assertTrue((self.data / "Systems").is_dir())
+        self.assertNotIn("Systems", self.get_json("/api/categories")["categories"])
 
     def test_stale_rows_can_be_left_alone(self):
         self.catalog.stage("Networking", [Proposal("gone.pdf", "gone.pdf")],

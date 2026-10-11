@@ -8,6 +8,12 @@
   --accent: #3b6ef5;
   --accent-soft: #e7efff;
   --danger: #d4383d;
+  --ok: #2f9e55;
+  --ai-idle: #c3c8d0;
+  --ai-head: #1f4fd1;     /* busy trail: the accent blue, dark to light */
+  --ai-tail: #bccffb;
+  --ok-glow: #b9f0cb;
+  --danger-glow: #ffc4c6;
   --shadow: 0 1px 3px rgba(20,25,40,.08);
 }
 @media (prefers-color-scheme: dark) {
@@ -21,6 +27,12 @@
     --accent: #5b8bff;
     --accent-soft: #1d2a45;
     --danger: #f0666b;
+    --ok: #4cc27a;
+    --ai-idle: #3a414e;
+    --ai-head: #5b8bff;   /* on a dark panel the trail fades out, not up */
+    --ai-tail: #2d4170;
+    --ok-glow: #86d4a2;   /* only a step lighter than --ok / --danger, */
+    --danger-glow: #f39497; /* so the settle doesn't flare */
     --shadow: 0 1px 3px rgba(0,0,0,.4);
   }
 }
@@ -50,6 +62,44 @@ header .brand .count { color: var(--muted); font-weight: 400; margin-left: 6px; 
   position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
   border: none; background: none; color: var(--muted); cursor: pointer;
   font-size: 16px; line-height: 1; padding: 2px 4px; display: none;
+}
+
+/* AI call status: gray idle, a thin marker sweeping back and forth while a
+   call is in flight, then green/red.
+
+   The marker is the head of a blue trail (dark to light; in dark mode it
+   fades out toward the bar instead). One keyframe
+   cycle is a sweep right then a sweep left; at the turn the element flips
+   (scaleX(-1)) so the trail always follows behind the marker. */
+.ai-bar {
+  flex: none; width: 1cm; height: 6px; margin-left: auto;
+  border-radius: 3px; background: var(--ai-idle);
+  position: relative; overflow: hidden;
+  transition: background-color .3s;
+  --ai-trail: 22px;   /* trail + marker */
+  --ai-marker: 3px;
+}
+.ai-bar.busy::after {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 0;
+  width: var(--ai-trail);
+  background: linear-gradient(to right, transparent 0%, var(--ai-tail) 25%,
+              var(--ai-head) calc(100% - var(--ai-marker)), var(--ai-head) 100%);
+  animation: ai-busy 2.4s ease-in-out infinite;
+}
+/* The glow into these colors is played from aistatus.js, not CSS: the panel
+   is rebuilt on every render, and a CSS animation would replay each time the
+   bar is moved into the new panel. */
+.ai-bar.ok    { background: var(--ok); }
+.ai-bar.error { background: var(--danger); }
+@keyframes ai-busy {
+  0%     { left: calc(var(--ai-marker) - var(--ai-trail)); transform: scaleX(1); }
+  49.99% { left: calc(100% - var(--ai-trail));             transform: scaleX(1); }
+  50%    { left: calc(100% - var(--ai-marker));            transform: scaleX(-1); }
+  100%   { left: 0;                                         transform: scaleX(-1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ai-bar.busy::after { animation: none; left: 0; width: 100%; transform: none;
+                        background: linear-gradient(to right, var(--ai-tail), var(--ai-head)); }
 }
 
 main { flex: 1; display: flex; min-height: 0; }
@@ -328,6 +378,32 @@ button.primary:disabled, button.danger:disabled, button.ghost:disabled {
   grid-column: 1 / -1; color: var(--muted); font-size: 11.5px; line-height: 1.5;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
+/* the model's category suggestions under a proposal */
+.row .candidates {
+  grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+}
+.row .candidates .label { color: var(--muted); font-size: 11px; margin-right: 2px; }
+.row .chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel);
+  color: var(--text); font: inherit; font-size: 12px; line-height: 1.4;
+}
+.row .chip:hover { border-color: var(--accent); }
+.row .chip.chosen { border-color: var(--accent); background: var(--accent-soft); cursor: default; }
+.row .chip .new {
+  padding: 0 5px; border-radius: 6px; font-size: 10px; font-weight: 650;
+  text-transform: uppercase; letter-spacing: .4px;
+  color: var(--accent); border: 1px solid var(--accent);
+}
+.row .chip .meter {
+  width: 36px; height: 4px; border-radius: 2px; background: var(--border); overflow: hidden;
+}
+.row .chip .meter .fill { display: block; height: 100%; background: var(--accent); }
+.row .chip .pct {
+  color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+  min-width: 3ch; text-align: right;
+}
 .row .drop {
   position: absolute; top: 8px; right: 8px; width: 20px; height: 20px;
   display: flex; align-items: center; justify-content: center;
@@ -402,6 +478,43 @@ button.primary:disabled, button.danger:disabled, button.ghost:disabled {
 }
 .dupe .paths .keep b { color: var(--text); }
 .dupe .paths .gone b { color: var(--danger); }
+.dupe .copies { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+.dupe .copy {
+  flex: 1 1 200px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--panel); font-size: 12.5px;
+}
+.dupe .copy.off { opacity: .55; }
+.dupe .copy .action {
+  padding: 2px 8px; margin-bottom: 2px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--accent); background: var(--panel); color: var(--accent);
+  font: inherit; font-size: 11px; font-weight: 650;
+}
+.dupe .copy .action:hover:not(:disabled) { background: var(--accent-soft); }
+.dupe .copy .action:disabled { cursor: default; }
+.dupe .copy.chosen .action { background: var(--accent); color: #fff; }
+.dupe .copy .category { font-weight: 600; overflow-wrap: anywhere; }
+.dupe .copy .meta {
+  display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px;
+}
+.dupe .copy .age {
+  padding: 0 6px; border-radius: 8px; font-size: 10.5px; font-weight: 600;
+  background: var(--panel-2); color: var(--muted);
+}
+.dupe .copy.chosen {
+  border-color: var(--accent); background: var(--accent-soft); cursor: default;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.dupe .copy .open {
+  font-size: 11.5px; color: var(--accent); text-decoration: none; margin-top: 2px;
+}
+.dupe .copy .open:hover { text-decoration: underline; }
+.dupe .why { color: var(--muted); font-size: 11.5px; margin-top: 1px; }
+.dupe .copy .file {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  color: var(--muted); overflow-wrap: anywhere;
+}
+.dupe .outcome { margin-top: 8px; font-size: 12px; color: var(--muted); }
 
 /* archived books */
 .archived {

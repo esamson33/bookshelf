@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .config import ARCHIVE_NAME, Config
-from .models import Proposal
+from .models import Proposal, candidates_json
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 #: Timestamp expression for applied_at / accessed_at writes.
 #
@@ -98,6 +98,7 @@ class Catalog:
                         applied_at    TEXT,
                         summary       TEXT,
                         accessed_at   TEXT,
+                        candidates    TEXT,
                         UNIQUE(directory, original_name)
                     )
                 """)
@@ -117,6 +118,11 @@ class Catalog:
                 if "proposed_name" in self._columns(TABLE):
                     self._conn.execute(
                         f"ALTER TABLE {TABLE} RENAME COLUMN proposed_name TO filename")
+
+                # v5: a pending proposal keeps the model's category
+                # suggestions (JSON) for the review to offer.
+                if "candidates" not in self._columns(TABLE):
+                    self._conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN candidates TEXT")
 
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
@@ -167,15 +173,15 @@ class Catalog:
             )
             return {r[0] for r in cur}
 
-    def pending(self, key: str) -> dict[str, tuple[str, str]]:
-        """{original_name: (filename, summary)} awaiting confirmation."""
+    def pending(self, key: str) -> dict[str, tuple[str, str, str | None]]:
+        """{original_name: (filename, summary, candidates JSON)} awaiting confirmation."""
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT original_name, filename, summary FROM {TABLE} "
+                f"SELECT original_name, filename, summary, candidates FROM {TABLE} "
                 "WHERE directory = ? AND status = 'pending'",
                 (key,),
             )
-            return {r[0]: (r[1], r[2] or "") for r in cur}
+            return {r[0]: (r[1], r[2] or "", r[3]) for r in cur}
 
     def pending_rows(self, key: str) -> list[dict]:
         """Pending proposals for `key`, each with the row id the UI edits by.
@@ -186,14 +192,14 @@ class Catalog:
         """
         with self._lock:
             cur = self._conn.execute(
-                f"SELECT id, original_name, filename, summary FROM {TABLE} "
+                f"SELECT id, original_name, filename, summary, candidates FROM {TABLE} "
                 "WHERE directory = ? AND status = 'pending' "
                 "ORDER BY original_name COLLATE NOCASE",
                 (key,),
             )
             return [
                 {"id": r[0], "original_name": r[1],
-                 "filename": r[2], "summary": r[3] or ""}
+                 "filename": r[2], "summary": r[3] or "", "candidates": r[4]}
                 for r in cur
             ]
 
@@ -256,27 +262,31 @@ class Catalog:
                 self._conn.execute(
                     f"""
                     INSERT INTO {TABLE}
-                        (directory, original_name, filename, summary, status, applied_at)
+                        (directory, original_name, filename, summary, status, applied_at,
+                         candidates)
                     VALUES (?, ?, ?, ?, ?,
-                            CASE ? WHEN 'applied' THEN {NOW_SQL} ELSE NULL END)
+                            CASE ? WHEN 'applied' THEN {NOW_SQL} ELSE NULL END, ?)
                     ON CONFLICT(directory, original_name) DO UPDATE SET
                         filename      = excluded.filename,
                         summary       = excluded.summary,
                         status        = excluded.status,
-                        applied_at    = excluded.applied_at
+                        applied_at    = excluded.applied_at,
+                        candidates    = excluded.candidates
                     """,
                     # summary is stored verbatim: "" means "looked up, none
                     # available" and must stay distinct from NULL, which
                     # missing_summaries() treats as "never attempted".
-                    (key, p.original_name, p.db_value, p.summary, status, status),
+                    # Suggestions only mean something while a row awaits review.
+                    (key, p.original_name, p.db_value, p.summary, status, status,
+                     candidates_json(p.candidates) if status == "pending" else None),
                 )
             self._conn.commit()
 
     def mark_applied(self, key: str, original_name: str) -> None:
         with self._lock:
             self._conn.execute(
-                f"UPDATE {TABLE} SET status = 'applied', applied_at = {NOW_SQL} "
-                "WHERE directory = ? AND original_name = ?",
+                f"UPDATE {TABLE} SET status = 'applied', applied_at = {NOW_SQL}, "
+                "candidates = NULL WHERE directory = ? AND original_name = ?",
                 (key, original_name),
             )
 
@@ -291,7 +301,7 @@ class Catalog:
             self._conn.execute(
                 f"""UPDATE {TABLE}
                     SET directory = ?, original_name = ?, filename = ?,
-                        status = 'applied', applied_at = {NOW_SQL}
+                        status = 'applied', applied_at = {NOW_SQL}, candidates = NULL
                     WHERE directory = ? AND original_name = ?""",
                 (dst_key, dst_name, dst_name, src_key, src_name),
             )
@@ -408,7 +418,7 @@ class Catalog:
         with self._lock:
             return self._conn.execute(
                 f"""SELECT id, directory, original_name, filename, summary,
-                           status, applied_at, accessed_at
+                           status, applied_at, accessed_at, candidates
                     FROM {TABLE} WHERE id = ?""",
                 (book_id,),
             ).fetchone()

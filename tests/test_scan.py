@@ -84,8 +84,16 @@ class CategoriesTest(ScanTestCase):
     def test_lists_directories_sorted_excluding_helpers(self):
         for name in ("Networking", "Algorithms", "__landing", ".hidden"):
             (self.data / name).mkdir()
+            (self.data / name / "a.pdf").write_bytes(b"%PDF")
         (self.data / "loose.pdf").write_bytes(b"%PDF")
         self.assertEqual(categories(self.data), ["Algorithms", "Networking"])
+
+    def test_a_category_with_no_pdfs_is_not_listed(self):
+        (self.data / "Empty").mkdir()
+        (self.data / "Empty" / "notes.txt").write_text("x")
+        (self.data / "Networking").mkdir()
+        (self.data / "Networking" / "a.pdf").write_bytes(b"%PDF")
+        self.assertEqual(categories(self.data), ["Networking"])
 
     def test_missing_root_is_empty(self):
         self.assertEqual(categories(self.data / "nope"), [])

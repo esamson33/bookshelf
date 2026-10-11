@@ -122,14 +122,22 @@ def build(ctx: Context, root: Path, recursive: bool, publisher: str) -> RenamePl
 
         stems = [Path(f).stem for _, files in new_groups for f in files]
         results = ctx.lookup.titles(stems, publisher)
+        # A row without both keys cannot be matched to a file; leaving it out
+        # means that file falls back to its own name rather than crashing.
+        results = [r for r in results
+                   if isinstance(r.get("original"), str) and isinstance(r.get("title"), str)]
         if not results:
+            # API failures (bad key, no credit, network) raise before here;
+            # reaching this means the model answered with nothing usable.
             raise PlanError(
-                "Could not retrieve titles from OpenAI. "
-                "Check your OPENAI_API_KEY and try again."
+                "The AI replied, but its answer had no usable titles. "
+                "Try the scan again; the reply is in the server's error log."
             )
 
-        titles = {r["original"]: r["title"] for r in results}
-        summaries = {r["original"]: r.get("summary", "") for r in results}
+        # Matched on the trimmed name: the model drops stray spaces, so a file
+        # like "Book (EX200) .pdf" would otherwise miss its own answer.
+        titles = {r["original"].strip(): r["title"] for r in results}
+        summaries = {r["original"].strip(): r.get("summary", "") for r in results}
 
         already_correct: list[tuple[Path, list[Proposal]]] = []
         for directory, files in new_groups:
@@ -138,8 +146,8 @@ def build(ctx: Context, root: Path, recursive: bool, publisher: str) -> RenamePl
                 stem = Path(fname).stem
                 proposal = Proposal.from_title(
                     original_name=fname,
-                    title=titles.get(stem, stem),
-                    summary=summaries.get(stem, ""),
+                    title=titles.get(stem.strip(), stem),
+                    summary=summaries.get(stem.strip(), ""),
                 )
                 (correct if proposal.is_noop else to_rename).append(proposal)
             if correct:
